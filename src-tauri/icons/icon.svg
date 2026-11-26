@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg-grad" x1="120" y1="80" x2="904" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E293B" />
+      <stop offset="55%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#0B1120" />
+    </linearGradient>
+    <linearGradient id="accent-grad" x1="340" y1="140" x2="684" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#3B82F6" />
+    </linearGradient>
+    <linearGradient id="card-grad" x1="256" y1="260" x2="768" y2="836" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#E2E8F0" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded-square app icon base -->
+  <rect x="48" y="48" width="928" height="928" rx="216" fill="url(#bg-grad)" />
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="none" stroke="#334155" stroke-width="10" />
+
+  <!-- Subtle stacked history card behind main clipboard sheet -->
+  <rect x="292" y="292" width="484" height="568" rx="76" fill="#1E3A5F" opacity="0.72" />
+
+  <!-- Main high-contrast clipboard sheet -->
+  <rect x="248" y="232" width="528" height="596" rx="76" fill="url(#card-grad)" />
+
+  <!-- Top clipboard clip -->
+  <rect x="372" y="152" width="280" height="124" rx="46" fill="url(#accent-grad)" />
+  <rect x="444" y="186" width="136" height="32" rx="16" fill="#0F172A" opacity="0.85" />
+
+  <!-- Layered history & snippet bars inside clipboard -->
+  <!-- Highlighted active entry -->
+  <rect x="316" y="344" width="392" height="84" rx="24" fill="#2563EB" />
+  <circle cx="364" cy="386" r="16" fill="#93C5FD" />
+  <rect x="404" y="372" width="252" height="28" rx="14" fill="#FFFFFF" />
+
+  <!-- History row 2 -->
+  <rect x="316" y="468" width="392" height="68" rx="20" fill="#CBD5E1" />
+  <rect x="352" y="490" width="248" height="24" rx="12" fill="#334155" />
+
+  <!-- History row 3 -->
+  <rect x="316" y="572" width="392" height="68" rx="20" fill="#CBD5E1" />
+  <rect x="352" y="594" width="308" height="24" rx="12" fill="#475569" />
+
+  <!-- Snippet / template badge row -->
+  <rect x="316" y="676" width="224" height="68" rx="20" fill="#CBD5E1" />
+  <rect x="352" y="698" width="144" height="24" rx="12" fill="#475569" />
+  <rect x="564" y="676" width="144" height="68" rx="20" fill="#0EA5E9" />
+  <circle cx="636" cy="710" r="16" fill="#FFFFFF" />
+</svg>
