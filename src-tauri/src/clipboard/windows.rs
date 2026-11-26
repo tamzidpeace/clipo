@@ -29,9 +29,9 @@ use windows_sys::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
     GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, MSG, SW_RESTORE, WM_CLIPBOARDUPDATE,
-    WM_CLOSE, WM_DESTROY, WNDCLASSW,
+    IsIconic, IsWindow, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, GWLP_USERDATA,
+    HWND_MESSAGE, MSG, SW_RESTORE, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DESTROY, WNDCLASSW,
 };
 
 use crate::clipboard::privacy::has_password_manager_marker;
@@ -387,7 +387,9 @@ unsafe extern "system" fn clipboard_wnd_proc(
             0
         }
         WM_DESTROY => {
-            windows_sys::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+            RemoveClipboardFormatListener(hwnd);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            PostQuitMessage(0);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -407,7 +409,7 @@ impl ClipboardBackend for WindowsClipboardBackend {
         let interval = poll_interval.max(Duration::from_millis(50));
 
         let stop_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let raw = hwnd_for_hook.load(Ordering::SeqCst);
+            let raw = hwnd_for_hook.load(Ordering::Acquire);
             if raw != 0 {
                 // SAFETY: `raw` is a live `HWND_MESSAGE` window created by the watcher thread.
                 unsafe {
@@ -449,24 +451,29 @@ impl ClipboardBackend for WindowsClipboardBackend {
                         on_snapshot: Arc::clone(&on_snapshot),
                     }));
                     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
-                    hwnd_raw.store(hwnd as isize, Ordering::SeqCst);
+                    hwnd_raw.store(hwnd as isize, Ordering::Release);
 
-                    let mut msg: MSG = unsafe { std::mem::zeroed() };
-                    while !stop_clone.load(Ordering::Relaxed) {
-                        let res = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
-                        if res <= 0 {
-                            break;
-                        }
-                        unsafe {
-                            TranslateMessage(&msg);
-                            DispatchMessageW(&msg);
+                    if !stop_clone.load(Ordering::Acquire) {
+                        let mut msg: MSG = unsafe { std::mem::zeroed() };
+                        while !stop_clone.load(Ordering::Acquire) {
+                            let res = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
+                            if res <= 0 {
+                                break;
+                            }
+                            unsafe {
+                                TranslateMessage(&msg);
+                                DispatchMessageW(&msg);
+                            }
                         }
                     }
 
-                    hwnd_raw.store(0, Ordering::SeqCst);
+                    hwnd_raw.store(0, Ordering::Release);
                     unsafe {
-                        RemoveClipboardFormatListener(hwnd);
-                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                        // DestroyWindow synchronously drives WM_DESTROY -> RemoveClipboardFormatListener
+                        // and clears GWLP_USERDATA before `state_ptr` is freed.
+                        if IsWindow(hwnd) != 0 {
+                            DestroyWindow(hwnd);
+                        }
                         drop(Box::from_raw(state_ptr));
                     }
                     return;
@@ -478,9 +485,9 @@ impl ClipboardBackend for WindowsClipboardBackend {
 
                 // Fallback sequence polling if HWND_MESSAGE listener could not be created.
                 let mut last_seq = unsafe { GetClipboardSequenceNumber() };
-                while !stop_clone.load(Ordering::Relaxed) {
+                while !stop_clone.load(Ordering::Acquire) {
                     thread::sleep(interval);
-                    if stop_clone.load(Ordering::Relaxed) {
+                    if stop_clone.load(Ordering::Acquire) {
                         break;
                     }
                     let seq = unsafe { GetClipboardSequenceNumber() };

@@ -196,15 +196,15 @@ impl ClipboardBackend for MacosClipboardBackend {
                 let mut last_change_count =
                     autoreleasepool(|_| NSPasteboard::generalPasteboard().changeCount());
 
-                while !stop_clone.load(Ordering::Relaxed) {
+                while !stop_clone.load(Ordering::Acquire) {
                     let mut remaining = interval;
                     let slice = Duration::from_millis(50);
-                    while remaining > Duration::ZERO && !stop_clone.load(Ordering::Relaxed) {
+                    while remaining > Duration::ZERO && !stop_clone.load(Ordering::Acquire) {
                         let step = remaining.min(slice);
                         thread::sleep(step);
                         remaining = remaining.saturating_sub(step);
                     }
-                    if stop_clone.load(Ordering::Relaxed) {
+                    if stop_clone.load(Ordering::Acquire) {
                         break;
                     }
 

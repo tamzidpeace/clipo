@@ -166,10 +166,7 @@ fn should_ignore_by_save_flags(
     }
 
     if has_image_format {
-        let multiword_text = plain_text
-            .map(str::trim)
-            .is_some_and(|t| t.split_whitespace().count() > 1);
-        if multiword_text {
+        if super::has_standalone_multiword_text(plain_text, None) {
             return !save_flags.save_text;
         }
         return !save_flags.save_images;

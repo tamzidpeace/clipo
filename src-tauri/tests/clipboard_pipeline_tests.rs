@@ -323,6 +323,23 @@ fn test_ignore_rules_app_allowlist_pasteboard_and_invalid_regex() {
     };
     assert!(evaluate_capture(img_snap, &[], &img_settings, &SelfWriteGuard::new()).is_none());
 
+    // Mixed image + multi-word filename with image extension must stay aligned with `save_images = false`.
+    let named_img_snap = RawClipboardSnapshot {
+        plain_text: Some("My Photo.png".to_string()),
+        image_bytes: Some(vec![0x89, 0x50, 0x4E, 0x47]),
+        pasteboard_types: vec!["public.png".to_string(), "public.utf8-plain-text".to_string()],
+        ..Default::default()
+    };
+    assert!(IgnoreMatcher::should_ignore(
+        Some("com.apple.Preview"),
+        &named_img_snap.pasteboard_types,
+        named_img_snap.plain_text.as_deref(),
+        &[],
+        false,
+        &img_settings.storage,
+    ));
+    assert!(evaluate_capture(named_img_snap, &[], &img_settings, &SelfWriteGuard::new()).is_none());
+
     let no_files = StorageSettings {
         save_files: false,
         ..Default::default()
@@ -470,12 +487,13 @@ fn test_self_write_suppression_skips_re_capture() {
         pasteboard_types: vec!["public.utf8-plain-text".to_string()],
         ..Default::default()
     };
-    backend.emit_watcher_snapshot(external.clone());
+    backend.emit_watcher_snapshot(external);
     assert_eq!(captured_items.lock().unwrap().len(), 1);
     assert_eq!(
         captured_items.lock().unwrap()[0].plain_text.as_deref(),
         Some("new user copy")
     );
+    _handle.stop();
 
     // Short-TTL guard expires cleanly.
     let short_guard = SelfWriteGuard::with_ttl(Duration::from_millis(15));

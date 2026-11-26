@@ -3,8 +3,9 @@ use std::env;
 use std::io::Read;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use wl_clipboard_rs::copy::{
@@ -21,7 +22,7 @@ use wl_clipboard_rs::watch::{
     Watcher as WlWatcher,
 };
 use x11rb::connection::Connection;
-use x11rb::protocol::xfixes::{self, ConnectionExt as _, SelectionEventMask};
+use x11rb::protocol::xfixes::{self, SelectionEventMask};
 use x11rb::protocol::xproto::{
     self, Atom, AtomEnum, ConnectionExt as _, EventMask, PropMode, SelectionNotifyEvent,
     WindowClass, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
@@ -44,11 +45,32 @@ enum LinuxSession {
     Headless,
 }
 
+#[derive(Debug)]
+struct X11OwnerHandle {
+    stop_flag: Arc<AtomicBool>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl X11OwnerHandle {
+    fn stop_and_join(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Linux clipboard backend supporting Wayland (`wl-clipboard-rs` + capability probe) and
 /// X11 (`x11rb` XFixes / XTest + selection owner thread).
 #[derive(Debug, Default)]
 pub struct LinuxClipboardBackend {
-    x11_owner_stop: Mutex<Option<Arc<AtomicBool>>>,
+    x11_owner: Mutex<Option<X11OwnerHandle>>,
+}
+
+impl Drop for LinuxClipboardBackend {
+    fn drop(&mut self) {
+        self.stop_x11_owner();
+    }
 }
 
 impl LinuxClipboardBackend {
@@ -119,10 +141,9 @@ impl LinuxClipboardBackend {
     }
 
     fn stop_x11_owner(&self) {
-        if let Ok(mut guard) = self.x11_owner_stop.lock() {
-            if let Some(prev) = guard.take() {
-                prev.store(true, Ordering::SeqCst);
-            }
+        let prev = self.x11_owner.lock().ok().and_then(|mut g| g.take());
+        if let Some(mut handle) = prev {
+            handle.stop_and_join();
         }
     }
 }
@@ -296,20 +317,38 @@ impl LinuxClipboardBackend {
         let entries = build_mime_entries(payload, plain_only)?;
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop_flag);
-        if let Ok(mut guard) = self.x11_owner_stop.lock() {
-            *guard = Some(Arc::clone(&stop_flag));
-        }
+        let (ready_tx, ready_rx) = sync_channel::<Result<(), ClipoError>>(1);
 
-        thread::Builder::new()
+        let join_handle = thread::Builder::new()
             .name("clipo-x11-selection-owner".to_string())
             .spawn(move || {
-                let _ = serve_x11_selection(entries, stop_clone);
+                serve_x11_selection(entries, stop_clone, ready_tx);
             })
             .map_err(|err| {
                 ClipoError::Clipboard(format!("failed to start X11 selection owner thread: {err}"))
             })?;
 
-        Ok(())
+        match ready_rx.recv() {
+            Ok(Ok(())) => {
+                if let Ok(mut guard) = self.x11_owner.lock() {
+                    *guard = Some(X11OwnerHandle {
+                        stop_flag,
+                        join_handle: Some(join_handle),
+                    });
+                }
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                let _ = join_handle.join();
+                Err(err)
+            }
+            Err(_) => {
+                let _ = join_handle.join();
+                Err(ClipoError::Clipboard(
+                    "X11 selection owner thread exited before acquiring CLIPBOARD".to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -404,7 +443,7 @@ fn start_wayland_watcher(on_snapshot: SnapshotCallback) -> Result<ClipboardWatch
         .name("clipo-wayland-clipboard".to_string())
         .spawn(move || {
             let mut is_initial_event = true;
-            while !stop_clone.load(Ordering::Relaxed) {
+            while !stop_clone.load(Ordering::Acquire) {
                 match watcher.next_event() {
                     Ok(Some(WlClipboardEvent::Changed { mime_types, .. })) => {
                         if is_initial_event {
@@ -483,17 +522,23 @@ fn read_wayland_snapshot_from_paste(initial_mimes: &[String]) -> Option<RawClipb
         .and_then(|m| read_mime(m))
         .filter(|b| !b.is_empty());
 
-    let plain_text = wl_get_contents(
-        WlPasteClipboardType::Regular,
-        WlPasteSeat::Unspecified,
-        WlPasteMimeType::Text,
-    )
-    .ok()
-    .and_then(|(mut pipe, _)| {
-        let mut s = String::new();
-        pipe.read_to_string(&mut s).ok()?;
-        Some(s)
-    });
+    const PLAIN_TEXT_MIMES: &[&str] = &[
+        "text/plain;charset=utf-8",
+        "text/plain; charset=utf-8",
+        "UTF8_STRING",
+        "text/plain",
+        "STRING",
+        "TEXT",
+    ];
+    let plain_text = PLAIN_TEXT_MIMES
+        .iter()
+        .find_map(|candidate| {
+            mimes
+                .iter()
+                .find(|offered| offered.eq_ignore_ascii_case(candidate))
+                .and_then(|offered| read_mime(offered))
+        })
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
 
     let html_payload = mimes
         .iter()
@@ -582,7 +627,7 @@ fn start_x11_watcher(
                 .map(|r| r.owner)
                 .unwrap_or(x11rb::NONE);
 
-            while !stop_clone.load(Ordering::Relaxed) {
+            while !stop_clone.load(Ordering::Acquire) {
                 if xfixes_enabled {
                     match conn.poll_for_event() {
                         Ok(Some(Event::XfixesSelectionNotify(ev))) => {
@@ -599,13 +644,14 @@ fn start_x11_watcher(
                     }
                 } else {
                     thread::sleep(interval);
-                    if stop_clone.load(Ordering::Relaxed) {
+                    if stop_clone.load(Ordering::Acquire) {
                         break;
                     }
-                    if let Ok(reply) = conn.get_selection_owner(clipboard_atom).and_then(|c| {
-                        c.reply()
-                            .map_err(x11rb::errors::ConnectionError::from)
-                    }) {
+                    if let Some(reply) = conn
+                        .get_selection_owner(clipboard_atom)
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                    {
                         if reply.owner != last_owner {
                             last_owner = reply.owner;
                             if reply.owner != x11rb::NONE {
@@ -744,10 +790,16 @@ fn request_x11_selection(
     None
 }
 
-fn serve_x11_selection(
-    entries: Vec<(String, Vec<u8>)>,
-    stop_flag: Arc<AtomicBool>,
-) -> Result<(), ClipoError> {
+struct X11SelectionSetup {
+    conn: RustConnection,
+    win: xproto::Window,
+    targets_atom: Atom,
+    atom_type: Atom,
+    offered_atoms: Vec<Atom>,
+    target_map: HashMap<Atom, Vec<u8>>,
+}
+
+fn setup_x11_selection(entries: Vec<(String, Vec<u8>)>) -> Result<X11SelectionSetup, ClipoError> {
     let (conn, screen_num) = x11rb::connect(None)
         .map_err(|err| ClipoError::Clipboard(format!("X11 connect failed: {err}")))?;
     let screen = &conn.setup().roots[screen_num];
@@ -786,7 +838,40 @@ fn serve_x11_selection(
     conn.flush()
         .map_err(|err| ClipoError::Clipboard(format!("X11 flush failed: {err}")))?;
 
-    while !stop_flag.load(Ordering::Relaxed) {
+    Ok(X11SelectionSetup {
+        conn,
+        win,
+        targets_atom,
+        atom_type,
+        offered_atoms,
+        target_map,
+    })
+}
+
+fn serve_x11_selection(
+    entries: Vec<(String, Vec<u8>)>,
+    stop_flag: Arc<AtomicBool>,
+    ready_tx: SyncSender<Result<(), ClipoError>>,
+) {
+    let X11SelectionSetup {
+        conn,
+        win,
+        targets_atom,
+        atom_type,
+        offered_atoms,
+        target_map,
+    } = match setup_x11_selection(entries) {
+        Ok(setup) => {
+            let _ = ready_tx.send(Ok(()));
+            setup
+        }
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+
+    while !stop_flag.load(Ordering::Acquire) {
         match conn.poll_for_event() {
             Ok(Some(Event::SelectionClear(_))) => break,
             Ok(Some(Event::SelectionRequest(req))) => {
@@ -844,7 +929,6 @@ fn serve_x11_selection(
 
     let _ = conn.destroy_window(win);
     let _ = conn.flush();
-    Ok(())
 }
 
 fn read_x11_frontmost_app() -> Option<AppTarget> {

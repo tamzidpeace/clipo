@@ -130,9 +130,10 @@ impl ClipboardWatcherHandle {
     }
 
     fn signal_and_join(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(ref hook) = self.stop_hook {
-            hook();
+        if !self.stop_flag.swap(true, Ordering::SeqCst) {
+            if let Some(ref hook) = self.stop_hook {
+                hook();
+            }
         }
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
@@ -421,7 +422,10 @@ pub fn create_platform_backend() -> Box<dyn ClipboardBackend> {
     }
 }
 
-fn has_standalone_multiword_text(plain_text: Option<&str>, html_payload: Option<&str>) -> bool {
+pub(crate) fn has_standalone_multiword_text(
+    plain_text: Option<&str>,
+    html_payload: Option<&str>,
+) -> bool {
     let Some(text) = plain_text else {
         if let Some(html) = html_payload {
             let lower = html.to_ascii_lowercase();
