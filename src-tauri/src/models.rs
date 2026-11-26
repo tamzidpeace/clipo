@@ -34,6 +34,9 @@ pub enum ClipoError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("validation error: {0}")]
+    Validation(String),
+
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 

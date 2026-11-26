@@ -1,5 +1,6 @@
 pub mod models;
 pub mod search;
+pub mod snippets;
 pub mod storage;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
