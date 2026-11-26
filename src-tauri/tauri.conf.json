@@ -26,7 +26,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' clipoimg: asset: https://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'",
+      "csp": "default-src 'self'; img-src 'self' clipoimg: http://clipoimg.localhost https://clipoimg.localhost asset: https://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'",
       "assetProtocol": {
         "enable": true,
         "scope": ["$APPDATA/**"]

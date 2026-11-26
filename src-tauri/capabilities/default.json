@@ -4,6 +4,9 @@
   "description": "Default capabilities for Clipo popup and settings windows",
   "windows": ["popup", "settings"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "autostart:default",
+    "global-shortcut:default",
+    "updater:default"
   ]
 }

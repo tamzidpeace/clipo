@@ -202,3 +202,53 @@ export interface SearchResultDto {
   total_snippet_count: number;
   regex_error: string | null;
 }
+
+export type PasteActionMode = 'copy_only' | 'copy_and_paste_rich' | 'copy_and_paste_plain';
+
+export interface PasteOutcome {
+  pasted: boolean;
+  copied: boolean;
+  degraded_reason: string | null;
+}
+
+export interface PlatformCapabilities {
+  os: string;
+  session_type: string;
+  can_watch_clipboard: boolean;
+  can_auto_paste: boolean;
+  accessibility_granted: boolean | null;
+  notes: string | null;
+}
+
+export interface StorageStats {
+  total_items: number;
+  pinned_items: number;
+  unpinned_items: number;
+  snippet_count: number;
+  db_bytes: number;
+  blob_bytes: number;
+  total_bytes: number;
+}
+
+export interface ItemDetailDto {
+  item: HistoryItemDto;
+  full_text: string | null;
+  rtf_payload: string | null;
+  html_payload: string | null;
+  file_paths: string[];
+}
+
+export interface RuntimeStatusDto {
+  paused: boolean;
+  ignore_next: boolean;
+  capabilities: PlatformCapabilities;
+}
+
+export interface UpdateStatusDto {
+  status: 'up_to_date' | 'update_available' | 'fallback' | 'error';
+  current_version: string;
+  available_version: string | null;
+  release_notes: string | null;
+  release_url: string;
+  message: string | null;
+}
