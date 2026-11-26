@@ -200,4 +200,5 @@ export interface SearchResultDto {
   rows: SearchRowDto[];
   total_history_count: number;
   total_snippet_count: number;
+  regex_error: string | null;
 }

@@ -464,6 +464,7 @@ pub struct SearchResultDto {
     pub rows: Vec<SearchRowDto>,
     pub total_history_count: usize,
     pub total_snippet_count: usize,
+    pub regex_error: Option<String>,
 }
 
 #[cfg(test)]
