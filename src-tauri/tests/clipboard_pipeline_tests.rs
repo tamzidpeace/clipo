@@ -1,0 +1,666 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use clipo_lib::clipboard::{
+    classify_and_build_capture, evaluate_capture, has_password_manager_marker, validate_ignore_regex,
+    AppTarget, ClipboardBackend, ClipboardWatcherHandle, IgnoreMatcher, PastePayload,
+    PlatformCapabilities, RawClipboardSnapshot, SelfWriteGuard, SnapshotCallback,
+};
+use clipo_lib::models::{
+    AppSettings, ClipoError, IgnoreRule, IgnoreRuleType, ItemKind, StorageSettings,
+};
+use clipo_lib::paste::{PasteActionMode, PasteEngine, PasteOutcome};
+
+#[derive(Default)]
+struct MockState {
+    written_payloads: Vec<(PastePayload, bool)>,
+    activated_apps: Vec<AppTarget>,
+    paste_shortcuts: Vec<Option<usize>>,
+    cleared_count: usize,
+    watcher_callbacks: Vec<SnapshotCallback>,
+    frontmost_app: Option<AppTarget>,
+    capabilities: Option<PlatformCapabilities>,
+}
+
+struct MockClipboardBackend {
+    state: Arc<Mutex<MockState>>,
+}
+
+impl MockClipboardBackend {
+    fn new(can_auto_paste: bool, degraded_note: Option<&str>) -> Self {
+        let state = MockState {
+            frontmost_app: Some(AppTarget {
+                app_id: Some("com.apple.Terminal".to_string()),
+                app_name: Some("Terminal".to_string()),
+                pid: Some(4242),
+            }),
+            capabilities: Some(PlatformCapabilities {
+                os: "mock".to_string(),
+                session_type: if can_auto_paste {
+                    "x11".to_string()
+                } else {
+                    "wayland".to_string()
+                },
+                can_watch_clipboard: true,
+                can_auto_paste,
+                accessibility_granted: Some(can_auto_paste),
+                notes: degraded_note.map(str::to_string),
+            }),
+            ..Default::default()
+        };
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    fn emit_watcher_snapshot(&self, snapshot: RawClipboardSnapshot) {
+        let callbacks = self.state.lock().unwrap().watcher_callbacks.clone();
+        for cb in callbacks {
+            cb(snapshot.clone());
+        }
+    }
+}
+
+impl ClipboardBackend for MockClipboardBackend {
+    fn start_watcher(
+        &self,
+        _poll_interval: Duration,
+        on_snapshot: SnapshotCallback,
+    ) -> Result<ClipboardWatcherHandle, ClipoError> {
+        self.state.lock().unwrap().watcher_callbacks.push(on_snapshot);
+        Ok(ClipboardWatcherHandle::from_parts(
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+        ))
+    }
+
+    fn write_payload(&self, payload: &PastePayload, plain_only: bool) -> Result<(), ClipoError> {
+        let effective = if plain_only {
+            let plain = payload.plain_text.clone().or_else(|| {
+                (!payload.file_paths.is_empty()).then(|| payload.file_paths.join("\n"))
+            });
+            PastePayload {
+                kind: ItemKind::Text,
+                plain_text: plain,
+                rtf_payload: None,
+                html_payload: None,
+                image_bytes: None,
+                file_paths: Vec::new(),
+            }
+        } else {
+            payload.clone()
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .written_payloads
+            .push((effective, plain_only));
+        Ok(())
+    }
+
+    fn clear_clipboard(&self) -> Result<(), ClipoError> {
+        self.state.lock().unwrap().cleared_count += 1;
+        Ok(())
+    }
+
+    fn current_frontmost_app(&self) -> Option<AppTarget> {
+        self.state.lock().unwrap().frontmost_app.clone()
+    }
+
+    fn activate_app(&self, target: &AppTarget) -> Result<(), ClipoError> {
+        self.state.lock().unwrap().activated_apps.push(target.clone());
+        Ok(())
+    }
+
+    fn send_paste_shortcut(&self, cursor_back_chars: Option<usize>) -> Result<(), ClipoError> {
+        self.state
+            .lock()
+            .unwrap()
+            .paste_shortcuts
+            .push(cursor_back_chars);
+        Ok(())
+    }
+
+    fn capabilities(&self) -> PlatformCapabilities {
+        self.state
+            .lock()
+            .unwrap()
+            .capabilities
+            .clone()
+            .expect("mock capabilities")
+    }
+}
+
+fn assert_send_sync<T: Send + Sync>() {}
+
+#[test]
+fn test_core_types_are_send_and_sync() {
+    assert_send_sync::<Box<dyn ClipboardBackend>>();
+    assert_send_sync::<SelfWriteGuard>();
+    assert_send_sync::<PasteEngine>();
+    assert_send_sync::<RawClipboardSnapshot>();
+    assert_send_sync::<PastePayload>();
+    assert_send_sync::<AppTarget>();
+    assert_send_sync::<PlatformCapabilities>();
+    assert_send_sync::<ClipboardWatcherHandle>();
+}
+
+#[test]
+fn test_password_manager_markers_ignored() {
+    let markers = [
+        "org.nspasteboard.TransientType",
+        "org.nspasteboard.ConcealedType",
+        "org.nspasteboard.AutoGeneratedType",
+        "com.agilebits.onepassword",
+        "ExcludeClipboardContentFromMonitorProcessing",
+        "CanIncludeInClipboardHistory",
+        "x-kde-passwordManagerHint",
+    ];
+
+    let rules: Vec<IgnoreRule> = Vec::new();
+    let settings = AppSettings::default();
+    let guard = SelfWriteGuard::new();
+
+    for marker in markers {
+        assert!(
+            has_password_manager_marker(&[marker.to_string()]),
+            "expected marker `{marker}` to be detected"
+        );
+        assert!(
+            has_password_manager_marker(&[marker.to_ascii_lowercase()]),
+            "expected lowercase marker `{marker}` to be detected"
+        );
+
+        let snap = RawClipboardSnapshot {
+            plain_text: Some("super-secret-password".to_string()),
+            pasteboard_types: vec!["public.utf8-plain-text".to_string(), marker.to_string()],
+            ..Default::default()
+        };
+        assert!(
+            evaluate_capture(snap, &rules, &settings, &guard).is_none(),
+            "expected snapshot with `{marker}` to be skipped"
+        );
+    }
+
+    assert!(!has_password_manager_marker(&[
+        "public.utf8-plain-text".to_string(),
+        "public.html".to_string(),
+        "CanIncludeInClipboardHistory=1".to_string(),
+    ]));
+}
+
+#[test]
+fn test_ignore_rules_app_allowlist_pasteboard_and_invalid_regex() {
+    let save_all = StorageSettings::default();
+    let rules = vec![
+        IgnoreRule {
+            id: 1,
+            rule_type: IgnoreRuleType::App,
+            pattern: "com.1password.1password".to_string(),
+            enabled: true,
+        },
+        IgnoreRule {
+            id: 2,
+            rule_type: IgnoreRuleType::App,
+            pattern: "com.apple.Terminal".to_string(),
+            enabled: false, // disabled rule must not match
+        },
+        IgnoreRule {
+            id: 3,
+            rule_type: IgnoreRuleType::PasteboardType,
+            pattern: "com.microsoft.ole.*".to_string(),
+            enabled: true,
+        },
+        IgnoreRule {
+            id: 4,
+            rule_type: IgnoreRuleType::Regex,
+            pattern: r"^ghp_[A-Za-z0-9]{10,}$".to_string(),
+            enabled: true,
+        },
+    ];
+
+    // Blocklist mode: listed enabled app is ignored; disabled app and unlisted app pass.
+    assert!(IgnoreMatcher::should_ignore(
+        Some("COM.1PASSWORD.1PASSWORD"),
+        &["public.utf8-plain-text".to_string()],
+        Some("normal text"),
+        &rules,
+        false,
+        &save_all,
+    ));
+    assert!(!IgnoreMatcher::should_ignore(
+        Some("com.apple.Terminal"),
+        &["public.utf8-plain-text".to_string()],
+        Some("ls -la"),
+        &rules,
+        false,
+        &save_all,
+    ));
+
+    // Allowlist mode ("Ignore all applications except listed"):
+    // only enabled App rules are permitted.
+    assert!(!IgnoreMatcher::should_ignore(
+        Some("com.1password.1password"),
+        &["public.utf8-plain-text".to_string()],
+        Some("allowed from listed app"),
+        &rules,
+        true,
+        &save_all,
+    ));
+    assert!(IgnoreMatcher::should_ignore(
+        Some("com.apple.Notes"),
+        &["public.utf8-plain-text".to_string()],
+        Some("unlisted app must be ignored"),
+        &rules,
+        true,
+        &save_all,
+    ));
+    assert!(IgnoreMatcher::should_ignore(
+        None,
+        &["public.utf8-plain-text".to_string()],
+        Some("unknown source app must be ignored in allowlist mode"),
+        &rules,
+        true,
+        &save_all,
+    ));
+
+    // Pasteboard type rule (supports exact & wildcard glob).
+    assert!(IgnoreMatcher::should_ignore(
+        Some("com.apple.Safari"),
+        &["com.microsoft.ole.source".to_string()],
+        Some("cell"),
+        &rules,
+        false,
+        &save_all,
+    ));
+
+    // Regex rule.
+    assert!(IgnoreMatcher::should_ignore(
+        Some("com.apple.Terminal"),
+        &["public.utf8-plain-text".to_string()],
+        Some("ghp_1234567890abcdef"),
+        &rules,
+        false,
+        &save_all,
+    ));
+    assert!(!IgnoreMatcher::should_ignore(
+        Some("com.apple.Terminal"),
+        &["public.utf8-plain-text".to_string()],
+        Some("hello world"),
+        &rules,
+        false,
+        &save_all,
+    ));
+
+    // Storage save_flags filtering.
+    let no_text = StorageSettings {
+        save_text: false,
+        ..Default::default()
+    };
+    assert!(IgnoreMatcher::should_ignore(
+        Some("com.apple.Notes"),
+        &["public.utf8-plain-text".to_string()],
+        Some("disabled text"),
+        &[],
+        false,
+        &no_text,
+    ));
+
+    let no_images = StorageSettings {
+        save_images: false,
+        ..Default::default()
+    };
+    let img_snap = RawClipboardSnapshot {
+        image_bytes: Some(vec![0x89, 0x50, 0x4E, 0x47]),
+        pasteboard_types: vec!["public.png".to_string()],
+        ..Default::default()
+    };
+    let img_settings = AppSettings {
+        storage: no_images,
+        ..Default::default()
+    };
+    assert!(evaluate_capture(img_snap, &[], &img_settings, &SelfWriteGuard::new()).is_none());
+
+    let no_files = StorageSettings {
+        save_files: false,
+        ..Default::default()
+    };
+    let file_snap = RawClipboardSnapshot {
+        file_paths: vec!["/tmp/a.txt".to_string()],
+        pasteboard_types: vec!["public.file-url".to_string()],
+        ..Default::default()
+    };
+    let file_settings = AppSettings {
+        storage: no_files,
+        ..Default::default()
+    };
+    assert!(evaluate_capture(file_snap, &[], &file_settings, &SelfWriteGuard::new()).is_none());
+
+    // Paused (`turn_off`) rejects all captures.
+    let mut paused_settings = AppSettings::default();
+    paused_settings.advanced.turn_off = true;
+    let paused_snap = RawClipboardSnapshot {
+        plain_text: Some("should not save while paused".to_string()),
+        pasteboard_types: vec!["public.utf8-plain-text".to_string()],
+        ..Default::default()
+    };
+    assert!(evaluate_capture(paused_snap, &[], &paused_settings, &SelfWriteGuard::new()).is_none());
+}
+
+#[test]
+fn test_ignore_engine_handles_invalid_regex() {
+    assert!(validate_ignore_regex("[unclosed").is_err());
+    assert!(validate_ignore_regex("^secret-[0-9]+$").is_ok());
+
+    let rules = vec![
+        IgnoreRule {
+            id: 10,
+            rule_type: IgnoreRuleType::Regex,
+            pattern: "[unclosed".to_string(),
+            enabled: true,
+        },
+        IgnoreRule {
+            id: 11,
+            rule_type: IgnoreRuleType::Regex,
+            pattern: "^BLOCKME:".to_string(),
+            enabled: true,
+        },
+    ];
+    let save_all = StorageSettings::default();
+
+    // Invalid regex does not panic and allows non-matching text through.
+    assert!(!IgnoreMatcher::should_ignore(
+        Some("com.apple.Notes"),
+        &["public.utf8-plain-text".to_string()],
+        Some("safe text"),
+        &rules,
+        false,
+        &save_all,
+    ));
+
+    // Subsequent valid regex rule still works.
+    assert!(IgnoreMatcher::should_ignore(
+        Some("com.apple.Notes"),
+        &["public.utf8-plain-text".to_string()],
+        Some("BLOCKME: token"),
+        &rules,
+        false,
+        &save_all,
+    ));
+}
+
+#[test]
+fn test_self_write_suppression_skips_re_capture() {
+    let backend = MockClipboardBackend::new(true, None);
+    let write_guard = Arc::new(SelfWriteGuard::new());
+    let settings = AppSettings::default();
+    let rules: Vec<IgnoreRule> = Vec::new();
+    let captured_items: Arc<Mutex<Vec<clipo_lib::models::CapturedPayload>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    let captured_clone = Arc::clone(&captured_items);
+    let guard_for_watcher = Arc::clone(&write_guard);
+    let settings_clone = settings.clone();
+    let _handle = backend
+        .start_watcher(
+            Duration::from_millis(50),
+            Arc::new(move |snap| {
+                if let Some(item) =
+                    evaluate_capture(snap, &[], &settings_clone, &guard_for_watcher)
+                {
+                    captured_clone.lock().unwrap().push(item);
+                }
+            }),
+        )
+        .expect("start mock watcher");
+
+    let payload = PastePayload {
+        kind: ItemKind::Text,
+        plain_text: Some("pasted from clipo".to_string()),
+        rtf_payload: None,
+        html_payload: Some("<b>pasted from clipo</b>".to_string()),
+        image_bytes: None,
+        file_paths: Vec::new(),
+    };
+
+    let prev_app = backend.current_frontmost_app();
+    let outcome = PasteEngine::execute(
+        &backend,
+        &write_guard,
+        &payload,
+        PasteActionMode::CopyAndPasteRich,
+        prev_app.as_ref(),
+        None,
+    )
+    .expect("execute paste");
+    assert_eq!(
+        outcome,
+        PasteOutcome {
+            pasted: true,
+            copied: true,
+            degraded_reason: None,
+        }
+    );
+
+    // Watcher fires immediately with identical text (even with no precomputed content_hash).
+    let echoed = RawClipboardSnapshot {
+        plain_text: Some("pasted from clipo".to_string()),
+        html_payload: Some("<b>pasted from clipo</b>".to_string()),
+        pasteboard_types: vec![
+            "public.utf8-plain-text".to_string(),
+            "public.html".to_string(),
+        ],
+        ..Default::default()
+    };
+    backend.emit_watcher_snapshot(echoed.clone());
+    assert!(
+        captured_items.lock().unwrap().is_empty(),
+        "watcher callback must drop self-written payload"
+    );
+    assert!(
+        evaluate_capture(echoed, &rules, &settings, &write_guard).is_none(),
+        "self-written payload must be suppressed from re-capture"
+    );
+
+    // Distinct clipboard write is captured normally.
+    let external = RawClipboardSnapshot {
+        plain_text: Some("new user copy".to_string()),
+        pasteboard_types: vec!["public.utf8-plain-text".to_string()],
+        ..Default::default()
+    };
+    backend.emit_watcher_snapshot(external.clone());
+    assert_eq!(captured_items.lock().unwrap().len(), 1);
+    assert_eq!(
+        captured_items.lock().unwrap()[0].plain_text.as_deref(),
+        Some("new user copy")
+    );
+
+    // Short-TTL guard expires cleanly.
+    let short_guard = SelfWriteGuard::with_ttl(Duration::from_millis(15));
+    short_guard.record_write("abc");
+    assert!(short_guard.is_suppressed("abc"));
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(!short_guard.is_suppressed("abc"));
+}
+
+#[test]
+fn test_paste_payload_strips_rich_when_plain_requested() {
+    let backend = MockClipboardBackend::new(true, None);
+    let write_guard = SelfWriteGuard::new();
+    let target = AppTarget {
+        app_id: Some("com.apple.Notes".to_string()),
+        app_name: Some("Notes".to_string()),
+        pid: Some(123),
+    };
+
+    let rich_payload = PastePayload {
+        kind: ItemKind::Text,
+        plain_text: Some("Hello Rich Text".to_string()),
+        rtf_payload: Some("{\\rtf1 Hello Rich Text}".to_string()),
+        html_payload: Some("<b>Hello Rich Text</b>".to_string()),
+        image_bytes: None,
+        file_paths: Vec::new(),
+    };
+
+    // Plain mode strips HTML and RTF.
+    let plain_outcome = PasteEngine::execute(
+        &backend,
+        &write_guard,
+        &rich_payload,
+        PasteActionMode::CopyAndPastePlain,
+        Some(&target),
+        Some(4),
+    )
+    .expect("plain paste");
+    assert!(plain_outcome.copied && plain_outcome.pasted);
+
+    // Rich mode keeps HTML and RTF.
+    let rich_outcome = PasteEngine::execute(
+        &backend,
+        &write_guard,
+        &rich_payload,
+        PasteActionMode::CopyAndPasteRich,
+        Some(&target),
+        None,
+    )
+    .expect("rich paste");
+    assert!(rich_outcome.copied && rich_outcome.pasted);
+
+    // CopyOnly writes clipboard without activating app or sending paste shortcut.
+    let copy_outcome = PasteEngine::execute(
+        &backend,
+        &write_guard,
+        &rich_payload,
+        PasteActionMode::CopyOnly,
+        Some(&target),
+        Some(2),
+    )
+    .expect("copy only");
+    assert_eq!(
+        copy_outcome,
+        PasteOutcome {
+            copied: true,
+            pasted: false,
+            degraded_reason: None,
+        }
+    );
+
+    let state = backend.state.lock().unwrap();
+    assert_eq!(state.written_payloads.len(), 3);
+
+    let (ref first_written, first_plain_only) = state.written_payloads[0];
+    assert!(first_plain_only);
+    assert_eq!(first_written.plain_text.as_deref(), Some("Hello Rich Text"));
+    assert!(first_written.html_payload.is_none());
+    assert!(first_written.rtf_payload.is_none());
+
+    let (ref second_written, second_plain_only) = state.written_payloads[1];
+    assert!(!second_plain_only);
+    assert_eq!(
+        second_written.html_payload.as_deref(),
+        Some("<b>Hello Rich Text</b>")
+    );
+    assert_eq!(
+        second_written.rtf_payload.as_deref(),
+        Some("{\\rtf1 Hello Rich Text}")
+    );
+
+    // Only the two auto-paste actions activated the app and sent shortcuts.
+    assert_eq!(state.activated_apps.len(), 2);
+    assert_eq!(state.paste_shortcuts, vec![Some(4), None]);
+
+    // Degraded capability (e.g. missing Accessibility / restricted Wayland) falls back cleanly.
+    let degraded_backend =
+        MockClipboardBackend::new(false, Some("Accessibility permission not granted"));
+    let degraded = PasteEngine::execute(
+        &degraded_backend,
+        &write_guard,
+        &rich_payload,
+        PasteActionMode::CopyAndPasteRich,
+        Some(&target),
+        None,
+    )
+    .expect("degraded paste should not fail");
+    assert_eq!(
+        degraded,
+        PasteOutcome {
+            copied: true,
+            pasted: false,
+            degraded_reason: Some("Accessibility permission not granted".to_string()),
+        }
+    );
+    let degraded_state = degraded_backend.state.lock().unwrap();
+    assert_eq!(degraded_state.written_payloads.len(), 1);
+    assert!(degraded_state.activated_apps.is_empty());
+    assert!(degraded_state.paste_shortcuts.is_empty());
+}
+
+#[test]
+fn test_mixed_image_and_html_wrapper_classifies_as_image() {
+    let fake_png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    // Browser "Copy Image": PNG bytes + <img src="..."> wrapper + no plain text -> Image.
+    let browser_img = RawClipboardSnapshot {
+        plain_text: None,
+        html_payload: Some("<meta charset='utf-8'><img src=\"https://example.com/a.png\">".to_string()),
+        image_bytes: Some(fake_png.clone()),
+        image_width: Some(320),
+        image_height: Some(240),
+        pasteboard_types: vec!["public.png".to_string(), "public.html".to_string()],
+        ..Default::default()
+    };
+    let captured = classify_and_build_capture(browser_img).expect("classify browser image");
+    assert_eq!(captured.kind, ItemKind::Image);
+    assert_eq!(captured.image_bytes, Some(fake_png.clone()));
+
+    // Image + single filename text + <img ...> -> still Image.
+    let filename_img = RawClipboardSnapshot {
+        plain_text: Some("screenshot.png".to_string()),
+        html_payload: Some("<img src=\"file:///tmp/screenshot.png\">".to_string()),
+        image_bytes: Some(fake_png.clone()),
+        pasteboard_types: vec![
+            "public.png".to_string(),
+            "public.html".to_string(),
+            "public.utf8-plain-text".to_string(),
+        ],
+        ..Default::default()
+    };
+    let captured_filename =
+        classify_and_build_capture(filename_img).expect("classify filename+image");
+    assert_eq!(captured_filename.kind, ItemKind::Image);
+
+    // Spreadsheet / document selection: standalone multi-word text + rendered image -> Text.
+    let spreadsheet = RawClipboardSnapshot {
+        plain_text: Some("Quarter\tRevenue\nQ1\t120000".to_string()),
+        html_payload: Some("<table><tr><td>Quarter</td><td>Revenue</td></tr></table>".to_string()),
+        image_bytes: Some(fake_png.clone()),
+        pasteboard_types: vec![
+            "public.utf8-plain-text".to_string(),
+            "public.html".to_string(),
+            "public.png".to_string(),
+        ],
+        ..Default::default()
+    };
+    let captured_sheet = classify_and_build_capture(spreadsheet).expect("classify spreadsheet");
+    assert_eq!(captured_sheet.kind, ItemKind::Text);
+    assert_eq!(
+        captured_sheet.plain_text.as_deref(),
+        Some("Quarter\tRevenue\nQ1\t120000")
+    );
+
+    // File copy with icon preview image -> File.
+    let file_copy = RawClipboardSnapshot {
+        plain_text: Some("report.png".to_string()),
+        image_bytes: Some(fake_png),
+        file_paths: vec!["/Users/demo/report.png".to_string()],
+        pasteboard_types: vec!["public.file-url".to_string(), "public.tiff".to_string()],
+        ..Default::default()
+    };
+    let captured_file = classify_and_build_capture(file_copy).expect("classify file");
+    assert_eq!(captured_file.kind, ItemKind::File);
+
+    // Empty clipboard -> None.
+    assert!(classify_and_build_capture(RawClipboardSnapshot::default()).is_none());
+}

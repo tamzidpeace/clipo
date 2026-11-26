@@ -30,6 +30,30 @@ regex = "1"
 sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util"] }
+url = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSDictionary", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", features = ["NSBitmapImageRep", "NSImageRep", "NSPasteboard", "NSPasteboardItem", "NSRunningApplication", "NSWorkspace"] }
+objc2-core-graphics = { version = "0.3", features = ["CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["xfixes", "xtest"] }
+wl-clipboard-rs = "0.9"
 
 [lints.cargo]
 # Tasks 2-7 wire up chrono, image, nucleo-matcher, sha2, regex, uuid, and tokio.

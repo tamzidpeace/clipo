@@ -1,4 +1,6 @@
+pub mod clipboard;
 pub mod models;
+pub mod paste;
 pub mod search;
 pub mod snippets;
 pub mod storage;
