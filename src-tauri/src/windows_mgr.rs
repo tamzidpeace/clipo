@@ -59,6 +59,22 @@ impl ClipoImgResponse {
     }
 }
 
+/// Resolves effective physical popup dimensions, falling back to scaled defaults when unmeasured or zero-sized.
+pub fn resolve_popup_size(measured: Option<(u32, u32)>, scale_factor: f64) -> (u32, u32) {
+    if let Some((w, h)) = measured.filter(|&(w, h)| w > 0 && h > 0) {
+        return (w, h);
+    }
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    (
+        (f64::from(DEFAULT_POPUP_WIDTH) * scale).round().max(1.0) as u32,
+        (f64::from(DEFAULT_POPUP_HEIGHT) * scale).round().max(1.0) as u32,
+    )
+}
+
 /// Computes target `(x, y)` coordinates for the popup window and clamps strictly inside `monitor_work_area`.
 pub fn compute_popup_position(
     mode: PopupPosition,
@@ -290,15 +306,10 @@ pub fn show_popup(app: &AppHandle) -> Result<(), ClipoError> {
             height: 1080,
         });
 
-    let popup_size = popup
-        .outer_size()
-        .map(|s| (s.width, s.height))
-        .unwrap_or_else(|_| {
-            (
-                (f64::from(DEFAULT_POPUP_WIDTH) * scale_factor).round() as u32,
-                (f64::from(DEFAULT_POPUP_HEIGHT) * scale_factor).round() as u32,
-            )
-        });
+    let popup_size = resolve_popup_size(
+        popup.outer_size().ok().map(|s| (s.width, s.height)),
+        scale_factor,
+    );
 
     let tray_rect = app
         .tray_by_id(crate::tray::MAIN_TRAY_ID)
@@ -340,6 +351,15 @@ pub fn on_popup_focus_lost(app: &AppHandle) {
 
 /// Opens the Settings window lazily, or focuses and switches tabs if it already exists.
 pub fn open_settings_window(app: &AppHandle, tab: Option<String>) -> Result<(), ClipoError> {
+    open_settings_window_with_action(app, tab, None)
+}
+
+/// Opens the Settings window lazily with an optional `action` query parameter for cold startup.
+pub fn open_settings_window_with_action(
+    app: &AppHandle,
+    tab: Option<String>,
+    action: Option<String>,
+) -> Result<(), ClipoError> {
     let _ = hide_popup(app);
 
     if let Some(existing) = app.get_webview_window(SETTINGS_LABEL) {
@@ -355,9 +375,17 @@ pub fn open_settings_window(app: &AppHandle, tab: Option<String>) -> Result<(), 
         return Ok(());
     }
 
-    let url = match tab.as_deref() {
-        Some(t) if !t.trim().is_empty() => format!("settings.html?tab={}", encode_query_value(t)),
-        _ => "settings.html".to_string(),
+    let mut params = Vec::new();
+    if let Some(t) = tab.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("tab={}", encode_query_value(t)));
+    }
+    if let Some(a) = action.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("action={}", encode_query_value(a)));
+    }
+    let url = if params.is_empty() {
+        "settings.html".to_string()
+    } else {
+        format!("settings.html?{}", params.join("&"))
     };
 
     #[cfg(target_os = "macos")]

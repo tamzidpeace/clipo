@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use clipo_lib::models::PopupPosition;
-use clipo_lib::windows_mgr::{compute_popup_position, resolve_clipoimg_blob, ScreenRect};
+use clipo_lib::windows_mgr::{
+    compute_popup_position, resolve_clipoimg_blob, resolve_popup_size, ScreenRect,
+};
 use uuid::Uuid;
 
 fn assert_within_work_area(pos: (i32, i32), popup_size: (u32, u32), work_area: ScreenRect) {
@@ -189,4 +191,14 @@ fn test_clipoimg_protocol_rejects_path_traversal() {
     assert_eq!(missing.status, 404);
 
     let _ = fs::remove_dir_all(&blobs_dir);
+}
+
+#[test]
+fn test_resolve_popup_size_ignores_zero_dimensions() {
+    assert_eq!(resolve_popup_size(None, 1.0), (440, 520));
+    assert_eq!(resolve_popup_size(Some((0, 0)), 2.0), (880, 1040));
+    assert_eq!(resolve_popup_size(Some((440, 0)), 1.5), (660, 780));
+    assert_eq!(resolve_popup_size(Some((0, 520)), 1.0), (440, 520));
+    assert_eq!(resolve_popup_size(Some((500, 620)), 2.0), (500, 620));
+    assert_eq!(resolve_popup_size(Some((0, 0)), 0.0), (440, 520));
 }

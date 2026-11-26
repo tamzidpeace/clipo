@@ -32,6 +32,7 @@ pub struct AppState {
     pub write_guard: Arc<SelfWriteGuard>,
     pub paused: Arc<AtomicBool>,
     pub ignore_next: Arc<AtomicBool>,
+    pub exiting: Arc<AtomicBool>,
     pub prev_app: Arc<Mutex<Option<AppTarget>>>,
     pub watcher_handle: Mutex<Option<ClipboardWatcherHandle>>,
     pub ipc_server: Mutex<Option<IpcServer>>,
@@ -53,6 +54,11 @@ impl AppState {
     /// Sets whether the next external clipboard change should be skipped.
     pub fn set_ignore_next_flag(&self, value: bool) {
         self.ignore_next.store(value, Ordering::Release);
+    }
+
+    /// Returns whether the application is currently shutting down.
+    pub fn is_exiting(&self) -> bool {
+        self.exiting.load(Ordering::Acquire)
     }
 
     /// Builds a snapshot of the live runtime status and platform capabilities.
@@ -95,10 +101,13 @@ impl AppState {
         app: &AppHandle,
         poll_interval: Duration,
     ) -> Result<(), ClipoError> {
-        if let Ok(mut guard) = self.watcher_handle.lock() {
-            if let Some(prev) = guard.take() {
-                prev.stop();
-            }
+        let prev = self
+            .watcher_handle
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(prev) = prev {
+            prev.stop();
         }
 
         let storage = Arc::clone(&self.storage);
@@ -180,14 +189,21 @@ impl AppState {
 
     /// Cleanly stops background watcher threads and IPC socket server on exit.
     pub fn cleanup_on_exit(&self) {
-        if let Ok(mut guard) = self.watcher_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.stop();
-            }
+        self.exiting.store(true, Ordering::Release);
+        let watcher = self
+            .watcher_handle
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(handle) = watcher {
+            handle.stop();
         }
-        if let Ok(mut guard) = self.ipc_server.lock() {
-            drop(guard.take());
-        }
+        let server = self
+            .ipc_server
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        drop(server);
     }
 }
 
@@ -199,7 +215,7 @@ fn handle_clipboard_snapshot(
     ignore_next: &AtomicBool,
     raw: RawClipboardSnapshot,
 ) {
-    if paused.load(Ordering::Acquire) {
+    if app.state::<AppState>().is_exiting() || paused.load(Ordering::Acquire) {
         return;
     }
 
@@ -244,6 +260,9 @@ fn handle_clipboard_snapshot(
 
 fn handle_ipc_command(app: &AppHandle, cmd: IpcCommand) {
     let state = app.state::<AppState>();
+    if state.is_exiting() {
+        return;
+    }
     match cmd {
         IpcCommand::Pause | IpcCommand::Resume => {
             let paused = matches!(cmd, IpcCommand::Pause);
@@ -295,6 +314,7 @@ pub fn run() {
             let write_guard = Arc::new(SelfWriteGuard::new());
             let paused = Arc::new(AtomicBool::new(settings.advanced.turn_off));
             let ignore_next = Arc::new(AtomicBool::new(false));
+            let exiting = Arc::new(AtomicBool::new(false));
 
             let state = AppState {
                 storage,
@@ -302,6 +322,7 @@ pub fn run() {
                 write_guard,
                 paused,
                 ignore_next,
+                exiting,
                 prev_app: Arc::new(Mutex::new(None)),
                 watcher_handle: Mutex::new(None),
                 ipc_server: Mutex::new(None),
@@ -390,6 +411,8 @@ pub fn run() {
     app.run(|app_handle, event| {
         if let RunEvent::Exit = event {
             let state = app_handle.state::<AppState>();
+            // Stop watcher & IPC server before exit cleanup so clearing clipboard cannot re-trigger capture.
+            state.cleanup_on_exit();
             if let Ok(settings) = state.storage.load_settings() {
                 if settings.advanced.clear_history_on_quit {
                     let _ = state.storage.clear_unpinned_history();
@@ -398,7 +421,6 @@ pub fn run() {
                     let _ = state.backend.clear_clipboard();
                 }
             }
-            state.cleanup_on_exit();
         }
     });
 }

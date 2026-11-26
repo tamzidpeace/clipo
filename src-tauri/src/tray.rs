@@ -111,13 +111,29 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), ClipoError> {
         .build(app)
         .map_err(|e| ClipoError::Internal(format!("failed to create system tray icon: {e}")))?;
 
-    sync_tray_state(app);
+    sync_tray_state_inner(app);
     Ok(())
 }
 
 /// Synchronizes tray visibility, menu text, and optional recent-copy title from current state.
+///
+/// Dispatches non-blockingly onto the main thread so background threads (clipboard watcher, IPC)
+/// never deadlock against main-thread `cleanup_on_exit` / `restart_watcher` joins.
 pub fn sync_tray_state(app: &AppHandle) {
+    if app.state::<AppState>().is_exiting() {
+        return;
+    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        sync_tray_state_inner(&handle);
+    });
+}
+
+fn sync_tray_state_inner(app: &AppHandle) {
     let state = app.state::<AppState>();
+    if state.is_exiting() {
+        return;
+    }
     let paused = state.is_paused();
     let settings = state.storage.load_settings().unwrap_or_default();
 
@@ -183,7 +199,11 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             let _ = windows_mgr::open_settings_window(app, Some("general".to_string()));
         }
         MENU_CHECK_UPDATES_ID => {
-            let _ = windows_mgr::open_settings_window(app, Some("general".to_string()));
+            let _ = windows_mgr::open_settings_window_with_action(
+                app,
+                Some("general".to_string()),
+                Some("check-updates".to_string()),
+            );
             let _ = app.emit("clipo://check-updates", ());
         }
         MENU_QUIT_ID => {
