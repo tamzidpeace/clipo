@@ -1,4 +1,5 @@
 pub mod clipboard;
+pub mod ipc;
 pub mod models;
 pub mod paste;
 pub mod search;
