@@ -2,4 +2,91 @@
 
 :root {
   color-scheme: light dark;
+  --clipo-surface: rgba(247, 247, 249, 0.92);
+  --clipo-surface-elevated: rgba(255, 255, 255, 0.88);
+  --clipo-surface-muted: rgba(0, 0, 0, 0.045);
+  --clipo-border: rgba(0, 0, 0, 0.11);
+  --clipo-border-subtle: rgba(0, 0, 0, 0.07);
+  --clipo-text: #18181b;
+  --clipo-text-muted: #52525b;
+  --clipo-text-faint: #71717a;
+  --clipo-accent: #2563eb;
+  --clipo-accent-soft: rgba(37, 99, 235, 0.14);
+  --clipo-selection: #2563eb;
+  --clipo-selection-text: #ffffff;
+  --clipo-badge-bg: rgba(0, 0, 0, 0.07);
+  --clipo-badge-text: #3f3f46;
+  --clipo-highlight-bg: rgba(250, 204, 21, 0.35);
+  --clipo-danger: #dc2626;
+  --clipo-warning: #d97706;
+  --clipo-syn-keyword: #9333ea;
+  --clipo-syn-string: #047857;
+  --clipo-syn-number: #c2410c;
+  --clipo-syn-comment: #71717a;
+  --clipo-syn-key: #1d4ed8;
+  --clipo-syn-boolean: #be123c;
+  --clipo-syn-variable: #0f766e;
+  --clipo-syn-operator: #52525b;
+}
+
+.theme-dark {
+  color-scheme: dark;
+  --clipo-surface: rgba(28, 28, 32, 0.94);
+  --clipo-surface-elevated: rgba(39, 39, 44, 0.94);
+  --clipo-surface-muted: rgba(255, 255, 255, 0.06);
+  --clipo-border: rgba(255, 255, 255, 0.12);
+  --clipo-border-subtle: rgba(255, 255, 255, 0.08);
+  --clipo-text: #f4f4f5;
+  --clipo-text-muted: #a1a1aa;
+  --clipo-text-faint: #71717a;
+  --clipo-accent: #3b82f6;
+  --clipo-accent-soft: rgba(59, 130, 246, 0.22);
+  --clipo-selection: #2563eb;
+  --clipo-selection-text: #ffffff;
+  --clipo-badge-bg: rgba(255, 255, 255, 0.11);
+  --clipo-badge-text: #d4d4d8;
+  --clipo-highlight-bg: rgba(250, 204, 21, 0.28);
+  --clipo-danger: #f87171;
+  --clipo-warning: #fbbf24;
+  --clipo-syn-keyword: #c084fc;
+  --clipo-syn-string: #34d399;
+  --clipo-syn-number: #fb923c;
+  --clipo-syn-comment: #71717a;
+  --clipo-syn-key: #60a5fa;
+  --clipo-syn-boolean: #fb7185;
+  --clipo-syn-variable: #2dd4bf;
+  --clipo-syn-operator: #a1a1aa;
+}
+
+.theme-light {
+  color-scheme: light;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+}
+
+.clipo-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.clipo-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.clipo-scroll::-webkit-scrollbar-thumb {
+  background: var(--clipo-border);
+  border-radius: 9999px;
+}
+
+.clipo-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--clipo-text-faint);
 }
