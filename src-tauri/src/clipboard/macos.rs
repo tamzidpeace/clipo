@@ -11,8 +11,13 @@ use objc2_app_kit::{
     NSPasteboardTypeHTML, NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString,
     NSPasteboardTypeTIFF, NSPasteboardWriting, NSRunningApplication, NSWorkspace,
 };
+use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFNumberType, CGRect, CFString};
 use objc2_core_graphics::{
-    CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGKeyCode,
+    kCGNullWindowID, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowLayer, kCGWindowOwnerPID,
+    CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGError, CGEvent,
+    CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGGetDisplaysWithRect,
+    CGKeyCode, CGMainDisplayID, CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo,
+    CGWindowListOption,
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSString, NSURL};
 
@@ -380,6 +385,56 @@ impl ClipboardBackend for MacosClipboardBackend {
         Self::read_frontmost_app()
     }
 
+    fn active_window_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        let frontmost = Self::read_frontmost_app()?;
+        let target_pid = frontmost.pid?;
+        let window_list = CGWindowListCopyWindowInfo(
+            CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+            kCGNullWindowID,
+        )?;
+
+        let count = window_list.count();
+        for idx in 0..count {
+            let raw_dict = unsafe { window_list.value_at_index(idx) };
+            if raw_dict.is_null() {
+                continue;
+            }
+            // SAFETY: `CGWindowListCopyWindowInfo` returns a `CFArray` of `CFDictionary` entries.
+            let dict = unsafe { &*(raw_dict.cast::<CFDictionary>()) };
+
+            if cf_dict_i32(dict, unsafe { kCGWindowOwnerPID }) != Some(target_pid) {
+                continue;
+            }
+            if cf_dict_i32(dict, unsafe { kCGWindowLayer }) != Some(0) {
+                continue;
+            }
+            if cf_dict_bool(dict, unsafe { kCGWindowIsOnscreen }) == Some(false) {
+                continue;
+            }
+
+            let bounds_ptr = unsafe { dict.value((kCGWindowBounds as *const CFString).cast()) };
+            if bounds_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: `kCGWindowBounds` stores a `CFDictionary` representing a `CGRect`.
+            let bounds_dict = unsafe { &*(bounds_ptr.cast::<CFDictionary>()) };
+            let mut rect = CGRect::default();
+            if unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds_dict), &mut rect) }
+                && rect.size.width >= 10.0
+                && rect.size.height >= 10.0
+            {
+                let scale = display_scale_for_rect(rect);
+                let x = (rect.origin.x * scale).round() as i32;
+                let y = (rect.origin.y * scale).round() as i32;
+                let width = (rect.size.width * scale).round().max(1.0) as u32;
+                let height = (rect.size.height * scale).round().max(1.0) as u32;
+                return Some((x, y, width, height));
+            }
+        }
+
+        None
+    }
+
     fn activate_app(&self, target: &AppTarget) -> Result<(), ClipoError> {
         autoreleasepool(|_| {
             let running: Option<Retained<NSRunningApplication>> = if let Some(pid) = target.pid {
@@ -450,4 +505,51 @@ impl ClipboardBackend for MacosClipboardBackend {
 
 fn is_tiff_bytes(bytes: &[u8]) -> bool {
     bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*")
+}
+
+fn cf_dict_i32(dict: &CFDictionary, key: &CFString) -> Option<i32> {
+    let ptr = unsafe { dict.value((key as *const CFString).cast()) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Caller supplies a numeric CoreGraphics window-info key whose value is a `CFNumber`.
+    let num = unsafe { &*(ptr.cast::<CFNumber>()) };
+    let mut out = 0i32;
+    let ok = unsafe { num.value(CFNumberType::IntType, (&mut out as *mut i32).cast()) };
+    ok.then_some(out)
+}
+
+fn cf_dict_bool(dict: &CFDictionary, key: &CFString) -> Option<bool> {
+    let ptr = unsafe { dict.value((key as *const CFString).cast()) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `kCGWindowIsOnscreen` stores a `CFBoolean`.
+    let boolean = unsafe { &*(ptr.cast::<CFBoolean>()) };
+    Some(boolean.value())
+}
+
+fn display_scale_for_rect(rect: CGRect) -> f64 {
+    let mut display_id: CGDirectDisplayID = 0;
+    let mut count: u32 = 0;
+    let err = unsafe { CGGetDisplaysWithRect(rect, 1, &mut display_id, &mut count) };
+    let target_display = if err == CGError::Success && count > 0 {
+        display_id
+    } else {
+        CGMainDisplayID()
+    };
+
+    if let Some(mode) = CGDisplayCopyDisplayMode(target_display) {
+        let logical_w = CGDisplayMode::width(Some(&mode));
+        let pixel_w = CGDisplayMode::pixel_width(Some(&mode));
+        if logical_w > 0 && pixel_w >= logical_w {
+            return (pixel_w as f64) / (logical_w as f64);
+        }
+    }
+
+    let bounds = CGDisplayBounds(target_display);
+    if bounds.size.width > 0.0 {
+        return 1.0;
+    }
+    1.0
 }

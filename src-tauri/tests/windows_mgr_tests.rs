@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clipo_lib::models::PopupPosition;
 use clipo_lib::windows_mgr::{
-    compute_popup_position, resolve_clipoimg_blob, resolve_popup_size, ScreenRect,
+    compute_popup_position, resolve_clipoimg_blob, resolve_popup_size, select_monitor_index,
+    should_suppress_tray_reopen, ScreenRect, TRAY_BLUR_SUPPRESS_WINDOW,
 };
 use uuid::Uuid;
 
@@ -179,6 +181,11 @@ fn test_clipoimg_protocol_rejects_path_traversal() {
     assert_eq!(ok_resp.status, 200);
     assert_eq!(ok_resp.content_type, "image/png");
     assert_eq!(ok_resp.body, sample_png);
+    let ok_http = ok_resp.into_http_response();
+    assert_eq!(
+        ok_http.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("public, max-age=31536000, immutable")
+    );
 
     // Windows custom protocol host form also resolves valid files.
     let win_resp = resolve_clipoimg_blob(&blobs_dir, "http://clipoimg.localhost/deadbeef.thumb.png");
@@ -186,9 +193,14 @@ fn test_clipoimg_protocol_rejects_path_traversal() {
     assert_eq!(win_resp.content_type, "image/png");
     assert_eq!(win_resp.body, sample_png);
 
-    // Valid relative filename that does not exist returns 404.
+    // Valid relative filename that does not exist returns 404 with non-cacheable header.
     let missing = resolve_clipoimg_blob(&blobs_dir, "clipoimg://localhost/missing.webp");
     assert_eq!(missing.status, 404);
+    let missing_http = missing.into_http_response();
+    assert_eq!(
+        missing_http.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
 
     let _ = fs::remove_dir_all(&blobs_dir);
 }
@@ -201,4 +213,107 @@ fn test_resolve_popup_size_ignores_zero_dimensions() {
     assert_eq!(resolve_popup_size(Some((0, 520)), 1.0), (440, 520));
     assert_eq!(resolve_popup_size(Some((500, 620)), 2.0), (500, 620));
     assert_eq!(resolve_popup_size(Some((0, 0)), 0.0), (440, 520));
+}
+
+#[test]
+fn test_should_suppress_tray_reopen_window() {
+    let blur = Instant::now();
+    assert!(!should_suppress_tray_reopen(None, blur));
+    assert!(should_suppress_tray_reopen(Some(blur), blur));
+    assert!(should_suppress_tray_reopen(
+        Some(blur),
+        blur + Duration::from_millis(120)
+    ));
+    assert!(should_suppress_tray_reopen(
+        Some(blur),
+        blur + TRAY_BLUR_SUPPRESS_WINDOW
+    ));
+    assert!(!should_suppress_tray_reopen(
+        Some(blur),
+        blur + TRAY_BLUR_SUPPRESS_WINDOW + Duration::from_millis(1)
+    ));
+}
+
+#[test]
+fn test_multi_monitor_selection_for_menu_icon_and_active_window() {
+    let monitors = vec![
+        ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        },
+        ScreenRect {
+            x: 1920,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        },
+    ];
+    let tray_on_second = Some(ScreenRect {
+        x: 4200,
+        y: 4,
+        width: 28,
+        height: 24,
+    });
+    let active_on_first = Some(ScreenRect {
+        x: 200,
+        y: 120,
+        width: 900,
+        height: 600,
+    });
+
+    assert_eq!(
+        select_monitor_index(
+            &monitors,
+            PopupPosition::MenuIcon,
+            (400, 400),
+            tray_on_second,
+            active_on_first
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        select_monitor_index(
+            &monitors,
+            PopupPosition::ActiveWindow,
+            (2500, 500),
+            tray_on_second,
+            active_on_first
+        ),
+        Some(0)
+    );
+    // Fallback to cursor monitor when preferred anchor is None or offscreen.
+    assert_eq!(
+        select_monitor_index(&monitors, PopupPosition::MenuIcon, (2500, 500), None, None),
+        Some(1)
+    );
+}
+
+#[test]
+fn test_tauri_conf_has_valid_updater_and_popup_config() {
+    let raw = include_str!("../tauri.conf.json");
+    let parsed: serde_json::Value = serde_json::from_str(raw).expect("parse tauri.conf.json");
+
+    let updater = parsed
+        .get("plugins")
+        .and_then(|p| p.get("updater"))
+        .expect("plugins.updater must exist to avoid startup panic");
+    assert!(
+        updater.get("pubkey").and_then(|v| v.as_str()).is_some(),
+        "plugins.updater.pubkey must be a string"
+    );
+    assert!(
+        updater.get("endpoints").and_then(|v| v.as_array()).is_some(),
+        "plugins.updater.endpoints must be an array"
+    );
+
+    let popup = parsed
+        .get("app")
+        .and_then(|a| a.get("windows"))
+        .and_then(|w| w.as_array())
+        .and_then(|arr| arr.first())
+        .expect("popup window entry must exist");
+    assert_eq!(popup.get("label").and_then(|v| v.as_str()), Some("popup"));
+    assert_eq!(popup.get("visible").and_then(|v| v.as_bool()), Some(false));
 }

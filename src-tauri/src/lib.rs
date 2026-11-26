@@ -11,14 +11,15 @@ pub mod windows_mgr;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
+#[cfg(desktop)]
 use tauri_plugin_autostart::MacosLauncher;
 
 use crate::clipboard::{
-    classify_and_build_capture, compute_capture_hash, create_platform_backend, evaluate_capture,
-    AppTarget, ClipboardBackend, ClipboardWatcherHandle, RawClipboardSnapshot, SelfWriteGuard,
+    compute_raw_snapshot_hash, create_platform_backend, evaluate_capture, AppTarget,
+    ClipboardBackend, ClipboardWatcherHandle, RawClipboardSnapshot, SelfWriteGuard,
 };
 use crate::commands::RuntimeStatusDto;
 use crate::ipc::{default_ipc_endpoint, IpcCommand, IpcServer};
@@ -34,6 +35,7 @@ pub struct AppState {
     pub ignore_next: Arc<AtomicBool>,
     pub exiting: Arc<AtomicBool>,
     pub prev_app: Arc<Mutex<Option<AppTarget>>>,
+    pub last_popup_blur_at: Mutex<Option<Instant>>,
     pub watcher_handle: Mutex<Option<ClipboardWatcherHandle>>,
     pub ipc_server: Mutex<Option<IpcServer>>,
     pub tray_pause_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
@@ -108,6 +110,9 @@ impl AppState {
             .and_then(|mut guard| guard.take());
         if let Some(prev) = prev {
             prev.stop();
+        }
+        if self.is_exiting() {
+            return Ok(());
         }
 
         let storage = Arc::clone(&self.storage);
@@ -225,8 +230,7 @@ fn handle_clipboard_snapshot(
             return;
         }
     }
-    if let Some(classified) = classify_and_build_capture(raw.clone()) {
-        let canonical_hash = compute_capture_hash(&classified);
+    if let Some(canonical_hash) = compute_raw_snapshot_hash(&raw) {
         if write_guard.is_suppressed(&canonical_hash) {
             return;
         }
@@ -283,20 +287,20 @@ fn handle_ipc_command(app: &AppHandle, cmd: IpcCommand) {
 /// Starts the Tauri Clipo desktop application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default().register_uri_scheme_protocol("clipoimg", |ctx, request| {
+        let state = ctx.app_handle().state::<AppState>();
+        let uri = request.uri().to_string();
+        windows_mgr::resolve_clipoimg_blob(state.storage.blobs_dir(), &uri).into_http_response()
+    });
+
+    #[cfg(desktop)]
+    let builder = builder
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .register_uri_scheme_protocol("clipoimg", |ctx, request| {
-            let state = ctx.app_handle().state::<AppState>();
-            let uri = request.uri().to_string();
-            windows_mgr::resolve_clipoimg_blob(state.storage.blobs_dir(), &uri).into_http_response()
-        });
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
     let app = builder
         .setup(|app| {
@@ -324,6 +328,7 @@ pub fn run() {
                 ignore_next,
                 exiting,
                 prev_app: Arc::new(Mutex::new(None)),
+                last_popup_blur_at: Mutex::new(None),
                 watcher_handle: Mutex::new(None),
                 ipc_server: Mutex::new(None),
                 tray_pause_item: Mutex::new(None),

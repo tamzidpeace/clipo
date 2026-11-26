@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use image::{ImageFormat, RgbaImage};
-use windows_sys::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
     GetClipboardData, GetClipboardFormatNameW, GetClipboardSequenceNumber, OpenClipboard,
@@ -28,10 +28,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, GWLP_USERDATA,
-    HWND_MESSAGE, MSG, SW_RESTORE, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DESTROY, WNDCLASSW,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW, PostQuitMessage,
+    RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage,
+    GWLP_USERDATA, HWND_MESSAGE, MSG, SW_RESTORE, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DESTROY,
+    WNDCLASSW,
 };
 
 use crate::clipboard::privacy::has_password_manager_marker;
@@ -641,6 +642,30 @@ impl ClipboardBackend for WindowsClipboardBackend {
 
     fn current_frontmost_app(&self) -> Option<AppTarget> {
         Self::read_frontmost_app()
+    }
+
+    fn active_window_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        // SAFETY: `GetForegroundWindow` returns null if no foreground window exists.
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: `rect` is a valid mutable `RECT` pointer and `hwnd` is non-null.
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return None;
+        }
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some((rect.left, rect.top, width as u32, height as u32))
     }
 
     fn activate_app(&self, target: &AppTarget) -> Result<(), ClipoError> {

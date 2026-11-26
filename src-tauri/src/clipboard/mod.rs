@@ -165,6 +165,11 @@ pub trait ClipboardBackend: Send + Sync {
     /// Captures the currently focused frontmost application, if determinable.
     fn current_frontmost_app(&self) -> Option<AppTarget>;
 
+    /// Returns the screen-coordinate bounding rectangle `(x, y, width, height)` of the active window, if available.
+    fn active_window_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        None
+    }
+
     /// Restores focus to `target` prior to dispatching a paste shortcut.
     fn activate_app(&self, target: &AppTarget) -> Result<(), ClipoError>;
 
@@ -266,6 +271,49 @@ pub fn compute_capture_hash(payload: &CapturedPayload) -> String {
         payload.image_bytes.as_deref(),
         &payload.file_paths,
     )
+}
+
+/// Computes the canonical SHA-256 content hash for a raw snapshot without cloning image or text buffers.
+pub fn compute_raw_snapshot_hash(raw: &RawClipboardSnapshot) -> Option<String> {
+    if !raw.file_paths.is_empty() {
+        return Some(compute_payload_hash(
+            ItemKind::File,
+            None,
+            None,
+            &raw.file_paths,
+        ));
+    }
+
+    let has_image = raw.image_bytes.as_ref().is_some_and(|b| !b.is_empty());
+    if has_image
+        && !has_standalone_multiword_text(raw.plain_text.as_deref(), raw.html_payload.as_deref())
+    {
+        return Some(compute_payload_hash(
+            ItemKind::Image,
+            None,
+            raw.image_bytes.as_deref(),
+            &[],
+        ));
+    }
+
+    let rtf_payload = raw.rtf_payload.as_deref().filter(|s| !s.is_empty());
+    let html_payload = raw.html_payload.as_deref().filter(|s| !s.is_empty());
+    match raw.plain_text.as_deref().filter(|s| !s.is_empty()) {
+        Some(text) => Some(compute_payload_hash(ItemKind::Text, Some(text), None, &[])),
+        None => {
+            let fallback = derive_plain_fallback(html_payload, rtf_payload);
+            if fallback.is_none() && rtf_payload.is_none() && html_payload.is_none() {
+                None
+            } else {
+                Some(compute_payload_hash(
+                    ItemKind::Text,
+                    fallback.as_deref(),
+                    None,
+                    &[],
+                ))
+            }
+        }
+    }
 }
 
 /// Classifies a raw OS snapshot into a `CapturedPayload` according to Clipo's multi-format rules.

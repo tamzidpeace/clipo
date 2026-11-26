@@ -3,13 +3,15 @@ use std::time::Duration;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
+#[cfg(desktop)]
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+#[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::clipboard::{validate_ignore_regex, PastePayload, PlatformCapabilities};
 use crate::models::{
     AppSettings, ClipoError, FilterTab, HistoryItem, IgnoreRule, IgnoreRuleType, ItemKind,
-    SearchResultDto, SearchRowKind, Snippet, SnippetInput, SortBy,
+    SearchResultDto, SearchRowKind, Snippet, SnippetInput,
 };
 use crate::paste::{PasteActionMode, PasteEngine, PasteOutcome};
 use crate::search::SearchEngine;
@@ -91,7 +93,7 @@ pub fn select_item(
         SearchRowKind::History => {
             let resolved = state.storage.read_item_payload(id)?;
             let plain_text = match resolved.item.kind {
-                ItemKind::File => resolved.item.plain_text.clone(),
+                ItemKind::File => None,
                 _ => resolved.full_text.or(resolved.item.plain_text),
             };
             let payload = PastePayload {
@@ -158,13 +160,7 @@ pub fn select_item(
 }
 
 fn latest_text_from_history(state: &AppState) -> Option<String> {
-    let item = state
-        .storage
-        .list_history(SortBy::LastCopied, 100)
-        .ok()?
-        .into_iter()
-        .filter(|item| item.kind == ItemKind::Text)
-        .max_by_key(|item| item.last_copied_at)?;
+    let item = state.storage.latest_copied_text_item().ok().flatten()?;
     if let Ok(resolved) = state.storage.read_item_payload(item.id) {
         return resolved.full_text.or(resolved.item.plain_text);
     }
@@ -307,12 +303,15 @@ pub fn update_settings(
     state.storage.save_settings(&settings)?;
     state.set_paused_flag(settings.advanced.turn_off);
 
-    let autolaunch = app.autolaunch();
-    if let Ok(currently_enabled) = autolaunch.is_enabled() {
-        if settings.general.launch_at_login && !currently_enabled {
-            let _ = autolaunch.enable();
-        } else if !settings.general.launch_at_login && currently_enabled {
-            let _ = autolaunch.disable();
+    #[cfg(desktop)]
+    {
+        let autolaunch = app.autolaunch();
+        if let Ok(currently_enabled) = autolaunch.is_enabled() {
+            if settings.general.launch_at_login && !currently_enabled {
+                let _ = autolaunch.enable();
+            } else if !settings.general.launch_at_login && currently_enabled {
+                let _ = autolaunch.disable();
+            }
         }
     }
 
@@ -382,7 +381,7 @@ pub fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatusDto
 }
 
 #[tauri::command]
-pub fn open_settings_window(app: AppHandle, tab: Option<String>) -> Result<(), ClipoError> {
+pub async fn open_settings_window(app: AppHandle, tab: Option<String>) -> Result<(), ClipoError> {
     windows_mgr::open_settings_window(&app, tab)
 }
 
@@ -418,47 +417,65 @@ pub fn open_accessibility_settings() -> Result<bool, ClipoError> {
 pub async fn check_for_updates(app: AppHandle) -> Result<UpdateStatusDto, ClipoError> {
     let current_version = app.package_info().version.to_string();
 
-    let updater = match app.updater_builder().build() {
-        Ok(updater) => updater,
-        Err(_) => {
-            return Ok(UpdateStatusDto {
-                status: "fallback".to_string(),
-                current_version,
-                available_version: None,
-                release_notes: None,
-                release_url: CLIPO_RELEASES_URL.to_string(),
-                message: Some(
-                    "Automatic updater endpoint is not configured for this build. Visit GitHub Releases to check for updates."
-                        .to_string(),
-                ),
-            });
-        }
-    };
-
-    match updater.check().await {
-        Ok(Some(update)) => Ok(UpdateStatusDto {
-            status: "update_available".to_string(),
-            current_version,
-            available_version: Some(update.version),
-            release_notes: update.body,
-            release_url: CLIPO_RELEASES_URL.to_string(),
-            message: Some("A newer version of Clipo is available.".to_string()),
-        }),
-        Ok(None) => Ok(UpdateStatusDto {
-            status: "up_to_date".to_string(),
-            current_version,
-            available_version: None,
-            release_notes: None,
-            release_url: CLIPO_RELEASES_URL.to_string(),
-            message: Some("You are running the latest version of Clipo.".to_string()),
-        }),
-        Err(err) => Ok(UpdateStatusDto {
+    #[cfg(not(desktop))]
+    {
+        return Ok(UpdateStatusDto {
             status: "fallback".to_string(),
             current_version,
             available_version: None,
             release_notes: None,
             release_url: CLIPO_RELEASES_URL.to_string(),
-            message: Some(format!("Unable to check updates automatically: {err}")),
-        }),
+            message: Some(
+                "Automatic updates are only supported on desktop builds. Visit GitHub Releases to check for updates."
+                    .to_string(),
+            ),
+        });
+    }
+
+    #[cfg(desktop)]
+    {
+        let updater = match app.updater_builder().build() {
+            Ok(updater) => updater,
+            Err(_) => {
+                return Ok(UpdateStatusDto {
+                    status: "fallback".to_string(),
+                    current_version,
+                    available_version: None,
+                    release_notes: None,
+                    release_url: CLIPO_RELEASES_URL.to_string(),
+                    message: Some(
+                        "Automatic updater endpoint is not configured for this build. Visit GitHub Releases to check for updates."
+                            .to_string(),
+                    ),
+                });
+            }
+        };
+
+        match updater.check().await {
+            Ok(Some(update)) => Ok(UpdateStatusDto {
+                status: "update_available".to_string(),
+                current_version,
+                available_version: Some(update.version),
+                release_notes: update.body,
+                release_url: CLIPO_RELEASES_URL.to_string(),
+                message: Some("A newer version of Clipo is available.".to_string()),
+            }),
+            Ok(None) => Ok(UpdateStatusDto {
+                status: "up_to_date".to_string(),
+                current_version,
+                available_version: None,
+                release_notes: None,
+                release_url: CLIPO_RELEASES_URL.to_string(),
+                message: Some("You are running the latest version of Clipo.".to_string()),
+            }),
+            Err(err) => Ok(UpdateStatusDto {
+                status: "fallback".to_string(),
+                current_version,
+                available_version: None,
+                release_notes: None,
+                release_url: CLIPO_RELEASES_URL.to_string(),
+                message: Some(format!("Unable to check updates automatically: {err}")),
+            }),
+        }
     }
 }

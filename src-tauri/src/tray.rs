@@ -1,8 +1,10 @@
+use std::time::Instant;
+
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::models::{ClipoError, SortBy};
+use crate::models::ClipoError;
 use crate::{windows_mgr, AppState};
 
 /// Identifier of the primary system tray icon.
@@ -157,9 +159,9 @@ fn sync_tray_state_inner(app: &AppHandle) {
     if settings.appearance.show_recent_copy_next_to_menu_icon {
         let recent_title = state
             .storage
-            .list_history(SortBy::LastCopied, 100)
+            .latest_copied_item()
             .ok()
-            .and_then(|items| items.into_iter().max_by_key(|item| item.last_copied_at))
+            .flatten()
             .map(|item| truncate_tray_title(&item.title_preview));
         let _ = tray.set_title(recent_title);
     } else {
@@ -176,7 +178,17 @@ fn handle_left_click(app: &AppHandle) {
     } else if alt {
         let _ = state.apply_paused(app, !state.is_paused());
     } else {
-        let _ = windows_mgr::toggle_popup(app);
+        let suppress = state
+            .last_popup_blur_at
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .is_some_and(|blurred_at| {
+                windows_mgr::should_suppress_tray_reopen(Some(blurred_at), Instant::now())
+            });
+        if !suppress {
+            let _ = windows_mgr::toggle_popup(app);
+        }
     }
 }
 
@@ -196,15 +208,21 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             }
         }
         MENU_PREFERENCES_ID => {
-            let _ = windows_mgr::open_settings_window(app, Some("general".to_string()));
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = windows_mgr::open_settings_window(&handle, Some("general".to_string()));
+            });
         }
         MENU_CHECK_UPDATES_ID => {
-            let _ = windows_mgr::open_settings_window_with_action(
-                app,
-                Some("general".to_string()),
-                Some("check-updates".to_string()),
-            );
-            let _ = app.emit("clipo://check-updates", ());
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = windows_mgr::open_settings_window_with_action(
+                    &handle,
+                    Some("general".to_string()),
+                    Some("check-updates".to_string()),
+                );
+                let _ = handle.emit("clipo://check-updates", ());
+            });
         }
         MENU_QUIT_ID => {
             app.exit(0);

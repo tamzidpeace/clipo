@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use tauri::http::{header::CONTENT_TYPE, Response};
 use tauri::{
@@ -21,6 +22,9 @@ pub const SETTINGS_LABEL: &str = "settings";
 const DEFAULT_POPUP_WIDTH: u32 = 440;
 const DEFAULT_POPUP_HEIGHT: u32 = 520;
 const MENU_ICON_GAP_PX: i32 = 4;
+
+/// Window during which a tray left-click immediately after popup blur will not reopen the popup.
+pub const TRAY_BLUR_SUPPRESS_WINDOW: Duration = Duration::from_millis(250);
 
 /// Axis-aligned rectangle in screen pixel coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,13 +54,62 @@ impl ClipoImgResponse {
 
     /// Converts into a Tauri HTTP response for `register_uri_scheme_protocol`.
     pub fn into_http_response(self) -> Response<Vec<u8>> {
+        let cache_control = if self.status == 200 {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-store"
+        };
         Response::builder()
             .status(self.status)
             .header(CONTENT_TYPE, self.content_type)
-            .header("Cache-Control", "public, max-age=31536000, immutable")
+            .header("Cache-Control", cache_control)
             .body(self.body)
             .unwrap_or_else(|_| Response::new(Vec::new()))
     }
+}
+
+/// Returns `true` when a tray left-click falls inside the post-blur debounce window.
+pub fn should_suppress_tray_reopen(last_blur: Option<Instant>, now: Instant) -> bool {
+    last_blur.is_some_and(|blurred_at| now.saturating_duration_since(blurred_at) <= TRAY_BLUR_SUPPRESS_WINDOW)
+}
+
+/// Returns the center point `(x, y)` of a `ScreenRect`.
+pub fn rect_center(rect: ScreenRect) -> (i32, i32) {
+    (
+        rect.x.saturating_add((rect.width as i32) / 2),
+        rect.y.saturating_add((rect.height as i32) / 2),
+    )
+}
+
+/// Returns `true` if `point` lies inside `rect` (`[x, x + width) × [y, y + height)`).
+pub fn rect_contains_point(rect: ScreenRect, point: (i32, i32)) -> bool {
+    let right = rect.x.saturating_add(rect.width as i32);
+    let bottom = rect.y.saturating_add(rect.height as i32);
+    point.0 >= rect.x && point.0 < right && point.1 >= rect.y && point.1 < bottom
+}
+
+/// Selects the monitor index matching `mode` (`MenuIcon` -> tray center, `ActiveWindow` -> window center,
+/// otherwise cursor), falling back to the cursor monitor if the preferred anchor is absent or offscreen.
+pub fn select_monitor_index(
+    monitors: &[ScreenRect],
+    mode: PopupPosition,
+    cursor: (i32, i32),
+    tray_rect: Option<ScreenRect>,
+    active_win: Option<ScreenRect>,
+) -> Option<usize> {
+    let preferred_point = match mode {
+        PopupPosition::MenuIcon => tray_rect.map(rect_center),
+        PopupPosition::ActiveWindow => active_win.map(rect_center),
+        PopupPosition::Cursor | PopupPosition::ScreenCenter => None,
+    };
+
+    if let Some(point) = preferred_point {
+        if let Some(idx) = monitors.iter().position(|&m| rect_contains_point(m, point)) {
+            return Some(idx);
+        }
+    }
+
+    monitors.iter().position(|&m| rect_contains_point(m, cursor))
 }
 
 /// Resolves effective physical popup dimensions, falling back to scaled defaults when unmeasured or zero-sized.
@@ -271,8 +324,11 @@ pub fn show_popup(app: &AppHandle) -> Result<(), ClipoError> {
     };
 
     let state = app.state::<AppState>();
+    if let Ok(mut guard) = state.last_popup_blur_at.lock() {
+        *guard = None;
+    }
 
-    // Record the previous foreground app BEFORE focusing Clipo's popup.
+    // Record the previous foreground app & active window bounds BEFORE focusing Clipo's popup.
     if let Some(frontmost) = state.backend.current_frontmost_app() {
         let self_pid = std::process::id() as i32;
         let is_self = frontmost.pid == Some(self_pid)
@@ -286,6 +342,15 @@ pub fn show_popup(app: &AppHandle) -> Result<(), ClipoError> {
             }
         }
     }
+    let active_win = state
+        .backend
+        .active_window_rect()
+        .map(|(x, y, width, height)| ScreenRect {
+            x,
+            y,
+            width,
+            height,
+        });
 
     let settings = state.storage.load_settings().unwrap_or_default();
 
@@ -294,7 +359,17 @@ pub fn show_popup(app: &AppHandle) -> Result<(), ClipoError> {
         .map(|pos| (pos.x.round() as i32, pos.y.round() as i32))
         .unwrap_or((0, 0));
 
-    let monitor = resolve_target_monitor(&popup, cursor);
+    let raw_tray_rect = app
+        .tray_by_id(crate::tray::MAIN_TRAY_ID)
+        .and_then(|tray| tray.rect().ok().flatten());
+
+    let monitor = resolve_target_monitor(
+        &popup,
+        settings.appearance.popup_at,
+        cursor,
+        raw_tray_rect.as_ref(),
+        active_win,
+    );
     let scale_factor = monitor.as_ref().map_or(1.0, Monitor::scale_factor);
     let work_area = monitor
         .as_ref()
@@ -311,26 +386,23 @@ pub fn show_popup(app: &AppHandle) -> Result<(), ClipoError> {
         scale_factor,
     );
 
-    let tray_rect = app
-        .tray_by_id(crate::tray::MAIN_TRAY_ID)
-        .and_then(|tray| tray.rect().ok().flatten())
-        .map(|rect| tauri_rect_to_screen_rect(rect, scale_factor));
+    let tray_rect = raw_tray_rect.map(|rect| tauri_rect_to_screen_rect(rect, scale_factor));
 
     let (x, y) = compute_popup_position(
         settings.appearance.popup_at,
         cursor,
         tray_rect,
-        None,
+        active_win,
         work_area,
         popup_size,
     );
 
     let _ = popup.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+    let _ = app.emit("clipo://popup-opened", ());
     popup
         .show()
         .map_err(|e| ClipoError::Internal(format!("failed to show popup: {e}")))?;
     let _ = popup.set_focus();
-    let _ = app.emit("clipo://popup-opened", ());
 
     Ok(())
 }
@@ -344,8 +416,18 @@ pub fn hide_popup(app: &AppHandle) -> Result<(), ClipoError> {
     Ok(())
 }
 
-/// Handles popup focus loss (`WindowEvent::Focused(false)`): hides popup and emits reset.
+/// Handles popup focus loss (`WindowEvent::Focused(false)`): records blur time if visible, hides popup, and emits reset.
 pub fn on_popup_focus_lost(app: &AppHandle) {
+    let was_visible = app
+        .get_webview_window(POPUP_LABEL)
+        .and_then(|popup| popup.is_visible().ok())
+        .unwrap_or(false);
+    if was_visible {
+        let state = app.state::<AppState>();
+        if let Ok(mut guard) = state.last_popup_blur_at.lock() {
+            *guard = Some(Instant::now());
+        };
+    }
     let _ = hide_popup(app);
 }
 
@@ -391,14 +473,23 @@ pub fn open_settings_window_with_action(
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
-    let win = WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App(url.into()))
+    let win = match WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App(url.into()))
         .title("Clipo Settings")
         .inner_size(780.0, 580.0)
         .min_inner_size(680.0, 480.0)
         .resizable(true)
         .center()
         .build()
-        .map_err(|e| ClipoError::Internal(format!("failed to create settings window: {e}")))?;
+    {
+        Ok(win) => win,
+        Err(e) => {
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            return Err(ClipoError::Internal(format!(
+                "failed to create settings window: {e}"
+            )));
+        }
+    };
 
     let _ = win.show();
     let _ = win.set_focus();
@@ -412,16 +503,29 @@ pub fn on_settings_destroyed(app: &AppHandle) {
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 }
 
-fn resolve_target_monitor(popup: &tauri::WebviewWindow, cursor: (i32, i32)) -> Option<Monitor> {
+fn resolve_target_monitor(
+    popup: &tauri::WebviewWindow,
+    mode: PopupPosition,
+    cursor: (i32, i32),
+    raw_tray_rect: Option<&tauri::Rect>,
+    active_win: Option<ScreenRect>,
+) -> Option<Monitor> {
     if let Ok(monitors) = popup.available_monitors() {
-        for monitor in monitors {
-            let pos = monitor.position();
-            let size = monitor.size();
-            let right = pos.x.saturating_add(size.width as i32);
-            let bottom = pos.y.saturating_add(size.height as i32);
-            if cursor.0 >= pos.x && cursor.0 < right && cursor.1 >= pos.y && cursor.1 < bottom {
-                return Some(monitor);
+        let monitor_rects: Vec<ScreenRect> = monitors.iter().map(monitor_bounds_rect).collect();
+
+        if mode == PopupPosition::MenuIcon {
+            if let Some(tray) = raw_tray_rect {
+                for (idx, m) in monitors.iter().enumerate() {
+                    let tray_rect = tauri_rect_to_screen_rect(*tray, m.scale_factor());
+                    if rect_contains_point(monitor_rects[idx], rect_center(tray_rect)) {
+                        return Some(m.clone());
+                    }
+                }
             }
+        }
+
+        if let Some(idx) = select_monitor_index(&monitor_rects, mode, cursor, None, active_win) {
+            return Some(monitors[idx].clone());
         }
     }
 
@@ -430,6 +534,17 @@ fn resolve_target_monitor(popup: &tauri::WebviewWindow, cursor: (i32, i32)) -> O
         .ok()
         .flatten()
         .or_else(|| popup.primary_monitor().ok().flatten())
+}
+
+fn monitor_bounds_rect(monitor: &Monitor) -> ScreenRect {
+    let pos = monitor.position();
+    let size = monitor.size();
+    ScreenRect {
+        x: pos.x,
+        y: pos.y,
+        width: size.width,
+        height: size.height,
+    }
 }
 
 fn monitor_work_area_rect(monitor: &Monitor) -> ScreenRect {

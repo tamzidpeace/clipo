@@ -224,6 +224,13 @@ impl ClipboardBackend for LinuxClipboardBackend {
         None
     }
 
+    fn active_window_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        if Self::detect_session() == LinuxSession::X11 {
+            return read_x11_active_window_rect();
+        }
+        None
+    }
+
     fn activate_app(&self, target: &AppTarget) -> Result<(), ClipoError> {
         if Self::detect_session() != LinuxSession::X11 {
             return Ok(());
@@ -955,6 +962,44 @@ fn serve_x11_selection(
 fn read_x11_frontmost_app() -> Option<AppTarget> {
     let (conn, _) = x11rb::connect(None).ok()?;
     read_x11_frontmost_app_with_conn(&conn)
+}
+
+fn read_x11_active_window_rect() -> Option<(i32, i32, u32, u32)> {
+    let (conn, _) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.first()?.root;
+    let active_atom = intern_atom(&conn, b"_NET_ACTIVE_WINDOW").ok()?;
+    let active_reply = conn
+        .get_property(false, root, active_atom, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    if active_reply.value.len() < 4 {
+        return None;
+    }
+    let active_win = u32::from_ne_bytes([
+        active_reply.value[0],
+        active_reply.value[1],
+        active_reply.value[2],
+        active_reply.value[3],
+    ]);
+    if active_win == 0 {
+        return None;
+    }
+    let geom = conn.get_geometry(active_win).ok()?.reply().ok()?;
+    if geom.width == 0 || geom.height == 0 {
+        return None;
+    }
+    let coords = conn
+        .translate_coordinates(active_win, root, 0, 0)
+        .ok()?
+        .reply()
+        .ok()?;
+    Some((
+        i32::from(coords.dst_x),
+        i32::from(coords.dst_y),
+        u32::from(geom.width),
+        u32::from(geom.height),
+    ))
 }
 
 fn read_x11_frontmost_app_with_conn(conn: &RustConnection) -> Option<AppTarget> {

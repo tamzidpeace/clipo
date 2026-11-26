@@ -238,6 +238,43 @@ impl StorageEngine {
         fetch_history_item(&conn, id)
     }
 
+    /// Returns the most recently copied history item regardless of pin status.
+    pub fn latest_copied_item(&self) -> Result<Option<HistoryItem>, ClipoError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, kind, content_hash, title_preview, full_text, plain_text,
+                    rtf_payload, html_payload, rich_blob_path, blob_path, thumb_path,
+                    image_width, image_height, byte_size, source_app_name, source_app_id,
+                    first_copied_at, last_copied_at, copy_count, is_pinned, pin_shortcut, pinned_at
+             FROM history_items
+             ORDER BY last_copied_at DESC, id DESC
+             LIMIT 1",
+            [],
+            row_to_history_item,
+        )
+        .optional()
+        .map_err(ClipoError::from)
+    }
+
+    /// Returns the most recently copied text history item regardless of pin status.
+    pub fn latest_copied_text_item(&self) -> Result<Option<HistoryItem>, ClipoError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, kind, content_hash, title_preview, full_text, plain_text,
+                    rtf_payload, html_payload, rich_blob_path, blob_path, thumb_path,
+                    image_width, image_height, byte_size, source_app_name, source_app_id,
+                    first_copied_at, last_copied_at, copy_count, is_pinned, pin_shortcut, pinned_at
+             FROM history_items
+             WHERE kind = 'text'
+             ORDER BY last_copied_at DESC, id DESC
+             LIMIT 1",
+            [],
+            row_to_history_item,
+        )
+        .optional()
+        .map_err(ClipoError::from)
+    }
+
     /// Toggles pin status on a history item, storing `shortcut` when newly pinned.
     pub fn toggle_pin(&self, id: i64, shortcut: Option<String>) -> Result<HistoryItem, ClipoError> {
         let conn = self.lock_conn()?;
