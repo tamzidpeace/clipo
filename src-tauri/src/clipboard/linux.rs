@@ -60,10 +60,17 @@ impl X11OwnerHandle {
     }
 }
 
+impl Drop for X11OwnerHandle {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 /// Linux clipboard backend supporting Wayland (`wl-clipboard-rs` + capability probe) and
 /// X11 (`x11rb` XFixes / XTest + selection owner thread).
 #[derive(Debug, Default)]
 pub struct LinuxClipboardBackend {
+    write_lock: Mutex<()>,
     x11_owner: Mutex<Option<X11OwnerHandle>>,
 }
 
@@ -164,6 +171,10 @@ impl ClipboardBackend for LinuxClipboardBackend {
     }
 
     fn write_payload(&self, payload: &PastePayload, plain_only: bool) -> Result<(), ClipoError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| ClipoError::Clipboard("Linux clipboard lock poisoned".to_string()))?;
         match Self::detect_session() {
             LinuxSession::Wayland => write_wayland(payload, plain_only),
             LinuxSession::X11 => self.write_x11(payload, plain_only),
@@ -174,6 +185,10 @@ impl ClipboardBackend for LinuxClipboardBackend {
     }
 
     fn clear_clipboard(&self) -> Result<(), ClipoError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| ClipoError::Clipboard("Linux clipboard lock poisoned".to_string()))?;
         self.stop_x11_owner();
         match Self::detect_session() {
             LinuxSession::Wayland => {
@@ -837,6 +852,12 @@ fn setup_x11_selection(entries: Vec<(String, Vec<u8>)>) -> Result<X11SelectionSe
         .map_err(|err| ClipoError::Clipboard(format!("X11 set_selection_owner failed: {err}")))?;
     conn.flush()
         .map_err(|err| ClipoError::Clipboard(format!("X11 flush failed: {err}")))?;
+    // Synchronous X11 roundtrip ensures the server has processed SetSelectionOwner
+    // before write_x11 returns and PasteEngine dispatches Ctrl+V.
+    let _ = conn
+        .get_selection_owner(clipboard_atom)
+        .ok()
+        .and_then(|c| c.reply().ok());
 
     Ok(X11SelectionSetup {
         conn,

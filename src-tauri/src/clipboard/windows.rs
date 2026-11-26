@@ -3,7 +3,7 @@ use std::io::Cursor;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -404,16 +404,19 @@ impl ClipboardBackend for WindowsClipboardBackend {
     ) -> Result<ClipboardWatcherHandle, ClipoError> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop_flag);
-        let hwnd_raw = Arc::new(AtomicIsize::new(0));
-        let hwnd_for_hook = Arc::clone(&hwnd_raw);
+        let hwnd_slot: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
+        let hwnd_for_hook = Arc::clone(&hwnd_slot);
         let interval = poll_interval.max(Duration::from_millis(50));
 
         let stop_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let raw = hwnd_for_hook.load(Ordering::Acquire);
-            if raw != 0 {
-                // SAFETY: `raw` is a live `HWND_MESSAGE` window created by the watcher thread.
-                unsafe {
-                    PostMessageW(raw as HWND, WM_CLOSE, 0, 0);
+            if let Ok(mut guard) = hwnd_for_hook.lock() {
+                if let Some(raw) = guard.take() {
+                    // SAFETY: `raw` is a live `HWND_MESSAGE` window still owned by the watcher thread;
+                    // taking from `hwnd_slot` under the lock ensures `PostMessageW` and `DestroyWindow`
+                    // cannot race.
+                    unsafe {
+                        PostMessageW(raw as HWND, WM_CLOSE, 0, 0);
+                    }
                 }
             }
         });
@@ -451,11 +454,22 @@ impl ClipboardBackend for WindowsClipboardBackend {
                         on_snapshot: Arc::clone(&on_snapshot),
                     }));
                     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
-                    hwnd_raw.store(hwnd as isize, Ordering::Release);
 
-                    if !stop_clone.load(Ordering::Acquire) {
+                    let should_run = hwnd_slot
+                        .lock()
+                        .map(|mut guard| {
+                            if stop_clone.load(Ordering::SeqCst) {
+                                false
+                            } else {
+                                *guard = Some(hwnd as isize);
+                                true
+                            }
+                        })
+                        .unwrap_or(false);
+
+                    if should_run {
                         let mut msg: MSG = unsafe { std::mem::zeroed() };
-                        while !stop_clone.load(Ordering::Acquire) {
+                        while !stop_clone.load(Ordering::SeqCst) {
                             let res = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
                             if res <= 0 {
                                 break;
@@ -467,7 +481,9 @@ impl ClipboardBackend for WindowsClipboardBackend {
                         }
                     }
 
-                    hwnd_raw.store(0, Ordering::Release);
+                    if let Ok(mut guard) = hwnd_slot.lock() {
+                        *guard = None;
+                    }
                     unsafe {
                         // DestroyWindow synchronously drives WM_DESTROY -> RemoveClipboardFormatListener
                         // and clears GWLP_USERDATA before `state_ptr` is freed.
