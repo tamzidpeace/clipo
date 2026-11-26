@@ -391,6 +391,11 @@ pub fn hide_popup(app: AppHandle) -> Result<(), ClipoError> {
 }
 
 #[tauri::command]
+pub fn set_preview_open(app: AppHandle, open: bool) -> Result<String, ClipoError> {
+    windows_mgr::set_preview_open(&app, open).map(str::to_string)
+}
+
+#[tauri::command]
 pub fn get_platform_capabilities(
     state: State<'_, AppState>,
 ) -> Result<PlatformCapabilities, ClipoError> {

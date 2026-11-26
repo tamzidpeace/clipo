@@ -182,6 +182,14 @@ export async function hidePopup(): Promise<void> {
   return invoke<void>('hide_popup');
 }
 
+export async function setPreviewOpen(open: boolean): Promise<'left' | 'right'> {
+  if (!isTauriRuntime()) {
+    return 'right';
+  }
+  const side = await invoke<string>('set_preview_open', { open });
+  return side === 'left' ? 'left' : 'right';
+}
+
 export async function getPlatformCapabilities(): Promise<PlatformCapabilities> {
   return invoke<PlatformCapabilities>('get_platform_capabilities');
 }

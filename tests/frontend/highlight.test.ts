@@ -46,6 +46,10 @@ describe('highlight utilities', () => {
     expect(snapped[0].text).toBe('🚀');
     expect(snapped[0].matched).toBe(true);
     expect(snapped.map((s) => s.text).join('')).toBe(text);
+
+    // Zero-length mid-surrogate range should be ignored rather than expanding to [0, 2]
+    const zeroMid = splitHighlightSegments(text, [{ start: 1, end: 1 }], 'bold');
+    expect(zeroMid).toEqual([{ text, matched: false, style: 'bold' }]);
   });
 
   it('clamps out-of-bounds, unsorted, and overlapping ranges without throwing', () => {

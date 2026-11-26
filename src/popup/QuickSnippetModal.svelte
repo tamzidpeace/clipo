@@ -25,11 +25,17 @@
   let titleInputEl: HTMLInputElement | null = $state(null);
 
   let isFromHistory = $derived(sourceItem !== null && sourceItem.kind !== 'image');
+  let wasOpen = false;
 
   $effect(() => {
     if (!open) {
+      wasOpen = false;
       return;
     }
+    if (wasOpen) {
+      return;
+    }
+    wasOpen = true;
     errorMsg = null;
     saving = false;
     if (sourceItem && sourceItem.kind !== 'image') {

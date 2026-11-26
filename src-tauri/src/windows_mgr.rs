@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use tauri::http::{header::CONTENT_TYPE, Response};
 use tauri::{
-    AppHandle, Emitter, Manager, Monitor, PhysicalPosition, Position, Size, WebviewUrl,
-    WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, Position, Size,
+    WebviewUrl, WebviewWindowBuilder,
 };
 
 use crate::models::{ClipoError, PopupPosition};
@@ -19,8 +19,9 @@ pub const POPUP_LABEL: &str = "popup";
 /// Window label for the lazily created settings/management window.
 pub const SETTINGS_LABEL: &str = "settings";
 
-const DEFAULT_POPUP_WIDTH: u32 = 440;
-const DEFAULT_POPUP_HEIGHT: u32 = 520;
+pub const DEFAULT_POPUP_WIDTH: u32 = 440;
+pub const DEFAULT_PREVIEW_EXTRA_WIDTH: u32 = 340;
+pub const DEFAULT_POPUP_HEIGHT: u32 = 520;
 const MENU_ICON_GAP_PX: i32 = 4;
 
 /// Window during which a tray left-click immediately after popup blur will not reopen the popup.
@@ -33,6 +34,15 @@ pub struct ScreenRect {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+/// Anchored popup geometry saved when the popup opens so preview expansion can attach left or right.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PopupAnchor {
+    pub base_x: i32,
+    pub base_y: i32,
+    pub work_area: ScreenRect,
+    pub scale_factor: f64,
 }
 
 /// HTTP-like response produced for `clipoimg://` protocol requests.
@@ -177,6 +187,39 @@ pub fn compute_popup_position(
         raw_x.clamp(monitor_work_area.x, max_x),
         raw_y.clamp(monitor_work_area.y, max_y),
     )
+}
+
+/// Computes target `(x, y, side)` for expanding or collapsing the preview pane sidecar.
+pub fn compute_preview_window_layout(
+    base_x: i32,
+    base_y: i32,
+    work_area: ScreenRect,
+    base_width_px: i32,
+    extra_width_px: i32,
+    open: bool,
+) -> (i32, i32, &'static str) {
+    if !open {
+        return (base_x, base_y, "right");
+    }
+
+    let total_width = base_width_px.saturating_add(extra_width_px);
+    let work_right = work_area.x.saturating_add(work_area.width as i32);
+    let max_x = work_area.x.max(work_right.saturating_sub(total_width));
+
+    let right_end = base_x.saturating_add(total_width);
+    if right_end <= work_right {
+        return (base_x.clamp(work_area.x, max_x), base_y, "right");
+    }
+
+    let raw_left_x = base_x.saturating_sub(extra_width_px);
+    let right_overflow = right_end.saturating_sub(work_right);
+    let left_underflow = work_area.x.saturating_sub(raw_left_x).max(0);
+
+    if right_overflow < left_underflow {
+        (base_x.clamp(work_area.x, max_x), base_y, "right")
+    } else {
+        (raw_left_x.clamp(work_area.x, max_x), base_y, "left")
+    }
 }
 
 /// Resolves a `clipoimg://` (or `http://clipoimg.localhost/`) URI exclusively within `blobs_dir`.
@@ -381,10 +424,11 @@ pub fn show_popup(app: &AppHandle) -> Result<(), ClipoError> {
             height: 1080,
         });
 
-    let popup_size = resolve_popup_size(
-        popup.outer_size().ok().map(|s| (s.width, s.height)),
-        scale_factor,
-    );
+    let _ = popup.set_size(Size::Logical(LogicalSize::new(
+        f64::from(DEFAULT_POPUP_WIDTH),
+        f64::from(DEFAULT_POPUP_HEIGHT),
+    )));
+    let popup_size = resolve_popup_size(None, scale_factor);
 
     let tray_rect = raw_tray_rect.map(|rect| tauri_rect_to_screen_rect(rect, scale_factor));
 
@@ -396,6 +440,15 @@ pub fn show_popup(app: &AppHandle) -> Result<(), ClipoError> {
         work_area,
         popup_size,
     );
+
+    if let Ok(mut guard) = state.popup_anchor.lock() {
+        *guard = Some(PopupAnchor {
+            base_x: x,
+            base_y: y,
+            work_area,
+            scale_factor,
+        });
+    }
 
     let _ = popup.set_position(Position::Physical(PhysicalPosition::new(x, y)));
     let _ = app.emit("clipo://popup-opened", ());
@@ -409,11 +462,70 @@ pub fn show_popup(app: &AppHandle) -> Result<(), ClipoError> {
 
 /// Hides the pre-warmed popup window without destroying it and notifies the UI to reset state.
 pub fn hide_popup(app: &AppHandle) -> Result<(), ClipoError> {
+    if let Ok(mut guard) = app.state::<AppState>().popup_anchor.lock() {
+        *guard = None;
+    }
     if let Some(popup) = app.get_webview_window(POPUP_LABEL) {
         let _ = popup.hide();
+        let _ = popup.set_size(Size::Logical(LogicalSize::new(
+            f64::from(DEFAULT_POPUP_WIDTH),
+            f64::from(DEFAULT_POPUP_HEIGHT),
+        )));
     }
     let _ = app.emit("clipo://popup-reset", ());
     Ok(())
+}
+
+/// Expands or collapses the popup window for the Preview Pane sidecar and returns the attached side (`"left"` or `"right"`).
+pub fn set_preview_open(app: &AppHandle, open: bool) -> Result<&'static str, ClipoError> {
+    let Some(popup) = app.get_webview_window(POPUP_LABEL) else {
+        return Err(ClipoError::NotFound("popup window not found".to_string()));
+    };
+
+    let target_width = if open {
+        f64::from(DEFAULT_POPUP_WIDTH + DEFAULT_PREVIEW_EXTRA_WIDTH)
+    } else {
+        f64::from(DEFAULT_POPUP_WIDTH)
+    };
+
+    let anchor = app
+        .state::<AppState>()
+        .popup_anchor
+        .lock()
+        .ok()
+        .and_then(|guard| *guard);
+
+    let side = if let Some(anchor) = anchor {
+        let scale = if anchor.scale_factor.is_finite() && anchor.scale_factor > 0.0 {
+            anchor.scale_factor
+        } else {
+            1.0
+        };
+        let base_width_px = (f64::from(DEFAULT_POPUP_WIDTH) * scale).round() as i32;
+        let extra_width_px = (f64::from(DEFAULT_PREVIEW_EXTRA_WIDTH) * scale).round() as i32;
+        let (x, y, side) = compute_preview_window_layout(
+            anchor.base_x,
+            anchor.base_y,
+            anchor.work_area,
+            base_width_px,
+            extra_width_px,
+            open,
+        );
+        let _ = popup.set_size(Size::Logical(LogicalSize::new(
+            target_width,
+            f64::from(DEFAULT_POPUP_HEIGHT),
+        )));
+        let _ = popup.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+        side
+    } else {
+        let _ = popup.set_size(Size::Logical(LogicalSize::new(
+            target_width,
+            f64::from(DEFAULT_POPUP_HEIGHT),
+        )));
+        "right"
+    };
+
+    Ok(side)
 }
 
 /// Handles popup focus loss (`WindowEvent::Focused(false)`): records blur time if visible, hides popup, and emits reset.

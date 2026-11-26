@@ -17,13 +17,16 @@
     searchItems,
     selectItem,
     setPaused,
+    setPreviewOpen,
     togglePin,
+    upsertSnippet,
   } from '../lib/ipc';
   import {
     DEFAULT_APP_SETTINGS,
     DEFAULT_FILTER_TABS,
     type AppSettingsDto,
     type FilterTab,
+    type HistoryItemDto,
     type ItemDetailDto,
     type PasteActionMode,
     type RuntimeStatusDto,
@@ -56,11 +59,13 @@
   let selectedIndex = $state(0);
 
   let previewOpen = $state(false);
+  let previewSide = $state<'left' | 'right'>('right');
   let previewDetail = $state<ItemDetailDto | null>(null);
   let previewLoading = $state(false);
 
   let quickSnippetOpen = $state(false);
   let quickSnippetBlank = $state(false);
+  let quickSnippetSourceItem = $state<HistoryItemDto | null>(null);
   let quickSnippetSourceText = $state('');
 
   let systemPrefersDark = $state(
@@ -71,6 +76,9 @@
 
   let searchSeq = 0;
   let detailSeq = 0;
+  let previewLayoutSeq = 0;
+  let popupSessionSeq = 0;
+  let previewWasOpen = false;
   let autoPreviewTimer: ReturnType<typeof setTimeout> | null = null;
 
   let resolvedDark = $derived(
@@ -159,14 +167,20 @@
   }
 
   function resetPopupState(): void {
+    popupSessionSeq += 1;
     clearAutoPreviewTimer();
     query = '';
     activeTab = 'all';
     selectedIndex = 0;
     previewOpen = false;
+    previewSide = 'right';
     previewDetail = null;
+    previewLoading = false;
     quickSnippetOpen = false;
     quickSnippetBlank = false;
+    quickSnippetSourceItem = null;
+    quickSnippetSourceText = '';
+    void refreshSearch(false);
   }
 
   function focusSearchInput(): void {
@@ -203,11 +217,24 @@
   }
 
   async function handlePinSelected(): Promise<void> {
-    if (!selectedRow || selectedRow.row_kind !== 'history' || !selectedRow.history_item) {
+    if (!selectedRow) {
       return;
     }
-    await togglePin(selectedRow.history_item.id, selectedRow.history_item.pin_shortcut);
-    await refreshSearch(true);
+    if (selectedRow.row_kind === 'history' && selectedRow.history_item) {
+      await togglePin(selectedRow.history_item.id, selectedRow.history_item.pin_shortcut);
+      await refreshSearch(true);
+    } else if (selectedRow.row_kind === 'snippet' && selectedRow.snippet) {
+      const snippet = selectedRow.snippet;
+      await upsertSnippet(snippet.id, {
+        title: snippet.title,
+        content: snippet.content,
+        tags: snippet.tags,
+        language: snippet.language,
+        shortcut_key: snippet.shortcut_key,
+        is_pinned: !snippet.is_pinned,
+      });
+      await refreshSearch(true);
+    }
   }
 
   async function handleDeleteSelected(): Promise<void> {
@@ -231,16 +258,22 @@
       selectedRow.history_item.kind === 'image'
     ) {
       quickSnippetBlank = true;
+      quickSnippetSourceItem = null;
       quickSnippetSourceText = '';
       quickSnippetOpen = true;
       return;
     }
 
-    quickSnippetBlank = false;
+    const session = popupSessionSeq;
     const item = selectedRow.history_item;
+    quickSnippetBlank = false;
+    quickSnippetSourceItem = item;
     let text = item.full_text ?? item.plain_text ?? item.title_preview;
     try {
       const detail = await getItemDetail(item.id);
+      if (session !== popupSessionSeq) {
+        return;
+      }
       if (item.kind === 'file') {
         text = detail.file_paths.join('\n');
       } else {
@@ -251,6 +284,9 @@
           item.title_preview;
       }
     } catch {
+      if (session !== popupSessionSeq) {
+        return;
+      }
       // Fallback to item preview text
     }
     quickSnippetSourceText = text;
@@ -260,6 +296,15 @@
   function normalizeEventKey(e: KeyboardEvent): string {
     if (e.code === 'Space') {
       return 'space';
+    }
+    if (e.code === 'Comma') {
+      return ',';
+    }
+    if (e.code === 'Period') {
+      return '.';
+    }
+    if (e.code === 'Slash') {
+      return '/';
     }
     if (e.code.startsWith('Key') && e.code.length === 4) {
       return e.code.slice(3).toLowerCase();
@@ -371,6 +416,19 @@
       return;
     }
 
+    const primaryMod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+    if (primaryMod && !e.altKey && !e.shiftKey && normalizeEventKey(e) === ',') {
+      e.preventDefault();
+      void openSettingsWindow('general');
+      return;
+    }
+
+    if (e.altKey && e.shiftKey && !e.metaKey && !e.ctrlKey && e.key === 'Backspace') {
+      e.preventDefault();
+      void clearUnpinned().then(() => refreshSearch(false));
+      return;
+    }
+
     if (matchesAccelerator(e, settings.general.preview_shortcut)) {
       e.preventDefault();
       previewOpen = !previewOpen;
@@ -397,7 +455,6 @@
     }
 
     // Cmd+1..9 (macOS) / Ctrl+1..9 (Win/Linux) quick-pick
-    const primaryMod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
     if (primaryMod && !e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
       const targetPick = Number(e.key);
       const match = searchResult.rows.find(
@@ -450,6 +507,7 @@
     // In `when_typing` mode, typing printable characters starts search immediately.
     if (
       settings.appearance.search_field === 'when_typing' &&
+      !e.isComposing &&
       !e.metaKey &&
       !e.ctrlKey &&
       !e.altKey &&
@@ -466,9 +524,31 @@
   $effect(() => {
     if (previewOpen && selectedRow) {
       void loadDetailForRow(selectedRow);
-    } else if (!previewOpen) {
+    } else {
+      detailSeq += 1;
       previewDetail = null;
+      previewLoading = false;
     }
+  });
+
+  $effect(() => {
+    const open = previewOpen;
+    if (!open && !previewWasOpen) {
+      return;
+    }
+    previewWasOpen = open;
+    const seq = ++previewLayoutSeq;
+    void setPreviewOpen(open)
+      .then((side) => {
+        if (seq === previewLayoutSeq) {
+          previewSide = side;
+        }
+      })
+      .catch(() => {
+        if (seq === previewLayoutSeq && !open) {
+          previewSide = 'right';
+        }
+      });
   });
 
   onMount(() => {
@@ -574,10 +654,28 @@
     }}
   />
 
+  {#snippet previewSidecar()}
+    <PreviewPane
+      row={selectedRow}
+      detail={previewDetail}
+      loading={previewLoading}
+      {isMac}
+      side={previewSide}
+      pinShortcut={settings.general.pin_shortcut}
+      saveSnippetShortcut={settings.general.save_snippet_shortcut}
+      deleteShortcut={settings.general.delete_shortcut}
+      onClose={() => {
+        previewOpen = false;
+      }}
+    />
+  {/snippet}
+
   <div class="flex min-h-0 flex-1 overflow-hidden">
-    <div
-      class={previewOpen ? 'flex min-h-0 w-[212px] shrink-0 flex-col' : 'flex min-h-0 flex-1 flex-col'}
-    >
+    {#if previewOpen && previewSide === 'left'}
+      {@render previewSidecar()}
+    {/if}
+
+    <div class="flex min-h-0 flex-1 min-w-0 flex-col">
       <ItemList
         rows={searchResult.rows}
         {selectedIndex}
@@ -607,16 +705,8 @@
       />
     </div>
 
-    {#if previewOpen}
-      <PreviewPane
-        row={selectedRow}
-        detail={previewDetail}
-        loading={previewLoading}
-        {isMac}
-        onClose={() => {
-          previewOpen = false;
-        }}
-      />
+    {#if previewOpen && previewSide === 'right'}
+      {@render previewSidecar()}
     {/if}
   </div>
 
@@ -647,7 +737,7 @@
 
   <QuickSnippetModal
     open={quickSnippetOpen}
-    sourceItem={quickSnippetBlank ? null : selectedRow?.history_item ?? null}
+    sourceItem={quickSnippetBlank ? null : quickSnippetSourceItem}
     sourceText={quickSnippetSourceText}
     onClose={() => {
       quickSnippetOpen = false;

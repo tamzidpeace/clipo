@@ -58,6 +58,9 @@ function normalizeRanges(text: string, ranges: MatchRangeDto[]): MatchRangeDto[]
     if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
       continue;
     }
+    if (range.end <= range.start) {
+      continue;
+    }
     const start = snapStartIndex(text, range.start);
     const end = snapEndIndex(text, range.end);
     if (end > start) {

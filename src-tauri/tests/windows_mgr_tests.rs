@@ -4,8 +4,10 @@ use std::time::{Duration, Instant};
 
 use clipo_lib::models::PopupPosition;
 use clipo_lib::windows_mgr::{
-    compute_popup_position, resolve_clipoimg_blob, resolve_popup_size, select_monitor_index,
-    should_suppress_tray_reopen, ScreenRect, TRAY_BLUR_SUPPRESS_WINDOW,
+    compute_popup_position, compute_preview_window_layout, resolve_clipoimg_blob,
+    resolve_popup_size, select_monitor_index, should_suppress_tray_reopen, ScreenRect,
+    DEFAULT_POPUP_HEIGHT, DEFAULT_POPUP_WIDTH, DEFAULT_PREVIEW_EXTRA_WIDTH,
+    TRAY_BLUR_SUPPRESS_WINDOW,
 };
 use uuid::Uuid;
 
@@ -316,4 +318,60 @@ fn test_tauri_conf_has_valid_updater_and_popup_config() {
         .expect("popup window entry must exist");
     assert_eq!(popup.get("label").and_then(|v| v.as_str()), Some("popup"));
     assert_eq!(popup.get("visible").and_then(|v| v.as_bool()), Some(false));
+}
+
+#[test]
+fn test_compute_preview_window_layout_expands_right_left_clamps_and_restores() {
+    assert_eq!(DEFAULT_POPUP_WIDTH, 440);
+    assert_eq!(DEFAULT_PREVIEW_EXTRA_WIDTH, 340);
+    assert_eq!(DEFAULT_POPUP_HEIGHT, 520);
+
+    let work_area = ScreenRect {
+        x: 0,
+        y: 25,
+        width: 1920,
+        height: 1055,
+    };
+
+    // Expands right when there is sufficient room to the right of the popup.
+    assert_eq!(
+        compute_preview_window_layout(300, 120, work_area, 440, 340, true),
+        (300, 120, "right")
+    );
+
+    // Expands left when near the right monitor edge so the expanded window stays on-screen.
+    assert_eq!(
+        compute_preview_window_layout(1480, 120, work_area, 440, 340, true),
+        (1140, 120, "left")
+    );
+
+    // Clamps cleanly inside work_area on a tight screen where left expansion would underflow.
+    let tight_area = ScreenRect {
+        x: 100,
+        y: 50,
+        width: 800,
+        height: 600,
+    };
+    assert_eq!(
+        compute_preview_window_layout(300, 100, tight_area, 440, 340, true),
+        (100, 100, "left")
+    );
+
+    // Ultra-narrow screen where right overflow is smaller than left underflow still clamps cleanly.
+    let ultra_narrow = ScreenRect {
+        x: 100,
+        y: 50,
+        width: 700,
+        height: 600,
+    };
+    assert_eq!(
+        compute_preview_window_layout(120, 100, ultra_narrow, 440, 340, true),
+        (100, 100, "right")
+    );
+
+    // Closing preview restores the original anchor coordinates and default right side.
+    assert_eq!(
+        compute_preview_window_layout(1480, 120, work_area, 440, 340, false),
+        (1480, 120, "right")
+    );
 }

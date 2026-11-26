@@ -13,26 +13,46 @@
     detail: ItemDetailDto | null;
     loading: boolean;
     isMac: boolean;
+    side?: 'left' | 'right';
+    pinShortcut?: string;
+    saveSnippetShortcut?: string;
+    deleteShortcut?: string;
     onClose: () => void;
   }
 
-  let { row, detail, loading, isMac, onClose }: Props = $props();
+  let {
+    row,
+    detail,
+    loading,
+    isMac,
+    side = 'right',
+    pinShortcut = 'Alt+P',
+    saveSnippetShortcut = 'Alt+S',
+    deleteShortcut = 'Alt+Backspace',
+    onClose,
+  }: Props = $props();
 
   let prettyJson = $state(true);
 
-  let historyItem = $derived(detail?.item ?? row?.history_item ?? null);
+  let activeDetail = $derived(row ? detail : null);
+  let historyItem = $derived(
+    row?.row_kind === 'history' ? (activeDetail?.item ?? row.history_item ?? null) : null,
+  );
   let snippet = $derived(row?.row_kind === 'snippet' ? row.snippet : null);
 
   let rawText = $derived.by(() => {
+    if (!row) {
+      return '';
+    }
     if (snippet) {
       return snippet.content;
     }
-    if (detail) {
+    if (activeDetail) {
       return (
-        detail.full_text ??
-        detail.item.full_text ??
-        detail.item.plain_text ??
-        detail.item.title_preview
+        activeDetail.full_text ??
+        activeDetail.item.full_text ??
+        activeDetail.item.plain_text ??
+        activeDetail.item.title_preview
       );
     }
     if (historyItem) {
@@ -75,14 +95,55 @@
   });
 
   let filePaths = $derived.by(() => {
-    if (detail?.file_paths?.length) {
-      return detail.file_paths;
+    if (activeDetail?.file_paths?.length) {
+      return activeDetail.file_paths;
     }
     if (historyItem?.kind === 'file' && historyItem.title_preview) {
       return historyItem.title_preview.split('\n').filter(Boolean);
     }
     return [];
   });
+
+  function formatShortcutHint(accel: string): string {
+    const parts = accel
+      .split('+')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.length === 0) {
+      return '';
+    }
+
+    const formatted = parts.map((part) => {
+      const lower = part.toLowerCase();
+      if (lower === 'commandorcontrol' || lower === 'cmdorctrl') {
+        return isMac ? '⌘' : 'Ctrl';
+      }
+      if (lower === 'command' || lower === 'cmd' || lower === 'meta' || lower === 'super') {
+        return isMac ? '⌘' : 'Super';
+      }
+      if (lower === 'control' || lower === 'ctrl') {
+        return isMac ? '⌃' : 'Ctrl';
+      }
+      if (lower === 'alt' || lower === 'option') {
+        return isMac ? '⌥' : 'Alt';
+      }
+      if (lower === 'shift') {
+        return isMac ? '⇧' : 'Shift';
+      }
+      if (lower === 'backspace') {
+        return '⌫';
+      }
+      if (lower === 'enter' || lower === 'return') {
+        return '↵';
+      }
+      if (lower === 'space') {
+        return 'Space';
+      }
+      return part.length === 1 ? part.toUpperCase() : part;
+    });
+
+    return isMac ? formatted.join('') : formatted.join('+');
+  }
 
   function formatBytes(bytes: number): string {
     if (bytes < 1024) {
@@ -131,6 +192,9 @@
   }
 
   let kindBadge = $derived.by(() => {
+    if (!row) {
+      return 'PREVIEW';
+    }
     if (snippet) {
       return snippet.language ? `SNIPPET · ${snippet.language.toUpperCase()}` : 'SNIPPET';
     }
@@ -152,7 +216,7 @@
 
 <aside
   aria-label="Item preview"
-  class="flex h-full min-h-0 flex-1 flex-col border-l"
+  class={`flex h-full min-h-0 w-[340px] max-w-[50vw] shrink-0 flex-col ${side === 'left' ? 'border-r' : 'border-l'}`}
   style:background-color="var(--clipo-surface-elevated)"
   style:border-color="var(--clipo-border-subtle)"
 >
@@ -312,10 +376,14 @@
             {historyItem.copy_count}×
           </div>
           <div class="truncate">
+            <span style:color="var(--clipo-text-faint)">First:</span>
+            {formatTimestamp(historyItem.first_copied_at)}
+          </div>
+          <div class="text-right tabular-nums">
             <span style:color="var(--clipo-text-faint)">Last:</span>
             {formatTimestamp(historyItem.last_copied_at)}
           </div>
-          <div class="text-right tabular-nums">
+          <div class="col-span-2 truncate tabular-nums">
             <span style:color="var(--clipo-text-faint)">Size:</span>
             {formatBytes(historyItem.byte_size)}
           </div>
@@ -335,8 +403,15 @@
         <span>↵ Paste</span>
         <span>{isMac ? '⌥↵' : 'Alt+↵'} Copy</span>
         <span>{isMac ? '⌘⇧↵' : 'Ctrl+⇧↵'} Plain</span>
-        <span>{isMac ? '⌥P' : 'Alt+P'} Pin</span>
-        <span>{isMac ? '⌥S' : 'Alt+S'} Snippet</span>
+        {#if pinShortcut.trim()}
+          <span>{formatShortcutHint(pinShortcut)} Pin</span>
+        {/if}
+        {#if saveSnippetShortcut.trim()}
+          <span>{formatShortcutHint(saveSnippetShortcut)} Snippet</span>
+        {/if}
+        {#if deleteShortcut.trim()}
+          <span>{formatShortcutHint(deleteShortcut)} Delete</span>
+        {/if}
       </div>
     </div>
   {/if}
