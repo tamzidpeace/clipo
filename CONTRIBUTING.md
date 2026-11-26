@@ -132,7 +132,7 @@ Releases are automated by `.github/workflows/release.yml` when pushing a version
 
 ### Enabling Signed Auto-Updates (`latest.json`)
 
-By default, `.github/workflows/release.yml` sets `includeUpdaterJson: false` and `src-tauri/tauri.conf.json` leaves `plugins.updater.pubkey` empty so unsigned tag builds succeed out of the box (falling back to GitHub Releases links in **Preferences → General**).
+By default, `.github/workflows/release.yml` sets `uploadUpdaterJson: false` and `src-tauri/tauri.conf.json` leaves `plugins.updater.pubkey` empty so unsigned tag builds succeed out of the box (falling back to GitHub Releases links in **Preferences → General**).
 
 To enable signed in-app updates:
 
@@ -143,8 +143,11 @@ To enable signed in-app updates:
 2. Add the **private key** contents and optional passphrase to your repository's GitHub Actions secrets:
    - `TAURI_SIGNING_PRIVATE_KEY`
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-3. Update `src-tauri/tauri.conf.json` with your generated **public key** and release manifest endpoint:
+3. Update `src-tauri/tauri.conf.json` to enable updater artifact generation plus your generated **public key** and release manifest endpoint:
    ```json
+   "bundle": {
+     "createUpdaterArtifacts": true
+   },
    "plugins": {
      "updater": {
        "pubkey": "<YOUR_GENERATED_PUBLIC_KEY>",
@@ -154,4 +157,4 @@ To enable signed in-app updates:
      }
    }
    ```
-4. Change `includeUpdaterJson: false` to `includeUpdaterJson: true` in `.github/workflows/release.yml`.
+4. Change `uploadUpdaterJson: false` to `uploadUpdaterJson: true` in `.github/workflows/release.yml`.

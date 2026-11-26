@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag name (e.g. v0.1.0); defaults to git ref name"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -80,18 +85,18 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Optional updater signing credentials. Keep `includeUpdaterJson: false`
+          # Optional updater signing credentials. Keep `uploadUpdaterJson: false`
           # until `TAURI_SIGNING_PRIVATE_KEY` is configured in GitHub Secrets and
-          # `plugins.updater.pubkey` + `plugins.updater.endpoints` are set in
-          # `src-tauri/tauri.conf.json`.
+          # `bundle.createUpdaterArtifacts`, `plugins.updater.pubkey`, and
+          # `plugins.updater.endpoints` are set in `src-tauri/tauri.conf.json`.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Clipo ${{ github.ref_name }}"
-          releaseBody: "See CHANGELOG / release notes for Clipo ${{ github.ref_name }}."
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: "Clipo ${{ inputs.tag || github.ref_name }}"
+          releaseBody: "See CHANGELOG / release notes for Clipo ${{ inputs.tag || github.ref_name }}."
           releaseDraft: true
           prerelease: false
           # Set to `true` only after configuring Tauri updater signing keys & endpoints.
-          includeUpdaterJson: false
+          uploadUpdaterJson: false
           args: ${{ matrix.args }}
