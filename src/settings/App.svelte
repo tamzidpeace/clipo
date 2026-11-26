@@ -79,6 +79,10 @@
   let bannerNotice = $state<string | null>(null);
   let activeRecorders = $state(0);
   let activeModals = $state(0);
+  let snippetsVisited = $state(false);
+  let snippetsDirty = $state(false);
+  let persistSeq = 0;
+  let inFlightPersists = 0;
 
   let systemPrefersDark = $state(
     typeof window !== 'undefined' &&
@@ -143,11 +147,29 @@
     if (!isTauriRuntime()) {
       return;
     }
+    const seq = ++persistSeq;
+    inFlightPersists += 1;
     try {
-      settings = await updateSettings(next);
+      const saved = await updateSettings(next);
+      if (seq === persistSeq) {
+        settings = saved;
+      }
     } catch (err) {
-      settings = previous;
       bannerError = err instanceof Error ? err.message : String(err);
+      if (seq === persistSeq) {
+        try {
+          const latest = await getSettings();
+          if (seq === persistSeq) {
+            settings = latest;
+          }
+        } catch {
+          if (seq === persistSeq) {
+            settings = previous;
+          }
+        }
+      }
+    } finally {
+      inFlightPersists = Math.max(0, inFlightPersists - 1);
     }
   }
 
@@ -325,6 +347,12 @@
     document.documentElement.classList.toggle('theme-light', !resolvedDark);
   });
 
+  $effect(() => {
+    if (activeTab === 'snippets') {
+      snippetsVisited = true;
+    }
+  });
+
   onMount(() => {
     const params =
       typeof window !== 'undefined'
@@ -337,7 +365,8 @@
     }
     const initialAction = params.get('action')?.trim().toLowerCase();
 
-    const unlisteners: Array<() => void> = [];
+    let unlisteners: Array<() => void> = [];
+    let disposed = false;
 
     void (async () => {
       if (isTauriRuntime()) {
@@ -347,54 +376,74 @@
             getRuntimeStatus(),
             getPlatformCapabilities(),
           ]);
-          settings = loadedSettings;
-          runtimeStatus = status;
-          capabilities = caps;
+          if (!disposed) {
+            if (persistSeq === 0) {
+              settings = loadedSettings;
+            }
+            runtimeStatus = status;
+            capabilities = caps;
+          }
         } catch (err) {
-          bannerError = err instanceof Error ? err.message : String(err);
+          if (!disposed) {
+            bannerError = err instanceof Error ? err.message : String(err);
+          }
         }
 
-        await Promise.all([refreshIgnoreRules(), refreshStorageStats()]);
+        if (!disposed) {
+          await Promise.all([refreshIgnoreRules(), refreshStorageStats()]);
+        }
+      }
+
+      if (disposed) {
+        return;
       }
 
       if (initialAction === 'check-updates') {
         void handleCheckUpdates();
       }
 
-      unlisteners.push(
-        await onSettingsChanged((updated) => {
-          settings = updated;
+      const fns = await Promise.all([
+        onSettingsChanged((updated) => {
+          if (!disposed && inFlightPersists === 0) {
+            settings = updated;
+          }
         }),
-      );
-      unlisteners.push(
-        await onRuntimeStatus((status) => {
-          runtimeStatus = status;
+        onRuntimeStatus((status) => {
+          if (!disposed) {
+            runtimeStatus = status;
+          }
         }),
-      );
-      unlisteners.push(
-        await onHistoryChanged(() => {
-          void refreshStorageStats();
+        onHistoryChanged(() => {
+          if (!disposed) {
+            void refreshStorageStats();
+          }
         }),
-      );
-      unlisteners.push(
-        await onSettingsTab((tab) => {
+        onSettingsTab((tab) => {
+          if (disposed) {
+            return;
+          }
           const target = normalizeTab(tab);
           if (target) {
             activeTab = target;
           }
         }),
-      );
-      unlisteners.push(
-        await onCheckUpdates(() => {
-          void handleCheckUpdates();
+        onCheckUpdates(() => {
+          if (!disposed) {
+            void handleCheckUpdates();
+          }
         }),
-      );
+      ]);
+
+      if (disposed) {
+        fns.forEach((fn) => fn());
+      } else {
+        unlisteners = fns;
+      }
     })();
 
     return () => {
-      for (const unlisten of unlisteners) {
-        unlisten();
-      }
+      disposed = true;
+      unlisteners.forEach((fn) => fn());
     };
   });
 </script>
@@ -449,6 +498,13 @@
             : 'var(--clipo-text-muted)'}
         >
           {tab.label}
+          {#if tab.id === 'snippets' && snippetsDirty}
+            <span
+              class="ml-1 inline-block h-1.5 w-1.5 rounded-full align-middle"
+              style:background-color="var(--clipo-accent)"
+              title="Unsaved snippet draft"
+            ></span>
+          {/if}
         </button>
       {/each}
     </nav>
@@ -532,21 +588,28 @@
           onUpsertRule={handleUpsertIgnoreRule}
           onDeleteRule={handleDeleteIgnoreRule}
         />
-      {:else if activeTab === 'snippets'}
-        <SnippetsTab
-          onRecordingChange={handleRecordingChange}
-          onModalOpenChange={handleModalOpenChange}
-          onSnippetsChanged={() => void refreshStorageStats()}
-        />
       {:else if activeTab === 'advanced'}
         <AdvancedTab
           {settings}
           {runtimeStatus}
           onUpdateAdvanced={updateAdvanced}
-          onTogglePaused={(paused) => void handleTogglePaused(paused)}
+          onTogglePaused={handleTogglePaused}
           onIgnoreNext={() => void handleIgnoreNext()}
           onClearUnpinned={handleClearUnpinned}
         />
+      {/if}
+
+      {#if snippetsVisited}
+        <div class={activeTab === 'snippets' ? 'h-full' : 'hidden'}>
+          <SnippetsTab
+            onRecordingChange={handleRecordingChange}
+            onModalOpenChange={handleModalOpenChange}
+            onSnippetsChanged={() => void refreshStorageStats()}
+            onDirtyChange={(dirty) => {
+              snippetsDirty = dirty;
+            }}
+          />
+        </div>
       {/if}
     </div>
   </section>

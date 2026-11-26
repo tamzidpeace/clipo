@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { matchesKeyboardEvent } from '../lib/hotkey';
   import {
     clearUnpinned,
     deleteItem,
@@ -293,76 +294,6 @@
     quickSnippetOpen = true;
   }
 
-  function normalizeEventKey(e: KeyboardEvent): string {
-    if (e.code === 'Space') {
-      return 'space';
-    }
-    if (e.code === 'Comma') {
-      return ',';
-    }
-    if (e.code === 'Period') {
-      return '.';
-    }
-    if (e.code === 'Slash') {
-      return '/';
-    }
-    if (e.code.startsWith('Key') && e.code.length === 4) {
-      return e.code.slice(3).toLowerCase();
-    }
-    if (e.code.startsWith('Digit') && e.code.length === 6) {
-      return e.code.slice(5);
-    }
-    return e.key.toLowerCase();
-  }
-
-  function matchesAccelerator(e: KeyboardEvent, accel: string): boolean {
-    const trimmed = accel.trim();
-    if (!trimmed) {
-      return false;
-    }
-    const parts = trimmed.split('+').map((p) => p.trim()).filter(Boolean);
-    let needCtrl = false;
-    let needMeta = false;
-    let needAlt = false;
-    let needShift = false;
-    let targetKey = '';
-
-    for (const part of parts) {
-      const lower = part.toLowerCase();
-      if (lower === 'commandorcontrol' || lower === 'cmdorctrl') {
-        if (isMac) {
-          needMeta = true;
-        } else {
-          needCtrl = true;
-        }
-      } else if (lower === 'command' || lower === 'cmd' || lower === 'meta' || lower === 'super') {
-        needMeta = true;
-      } else if (lower === 'control' || lower === 'ctrl') {
-        needCtrl = true;
-      } else if (lower === 'alt' || lower === 'option') {
-        needAlt = true;
-      } else if (lower === 'shift') {
-        needShift = true;
-      } else {
-        targetKey = lower;
-      }
-    }
-
-    if (!targetKey) {
-      return false;
-    }
-    if (
-      e.ctrlKey !== needCtrl ||
-      e.metaKey !== needMeta ||
-      e.altKey !== needAlt ||
-      e.shiftKey !== needShift
-    ) {
-      return false;
-    }
-
-    return normalizeEventKey(e) === targetKey;
-  }
-
   function cycleTab(direction: 1 | -1): void {
     const idx = DEFAULT_FILTER_TABS.indexOf(activeTab);
     const nextIdx =
@@ -417,38 +348,38 @@
     }
 
     const primaryMod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
-    if (primaryMod && !e.altKey && !e.shiftKey && normalizeEventKey(e) === ',') {
+    if (matchesKeyboardEvent(e, 'CommandOrControl+,', isMac)) {
       e.preventDefault();
       void openSettingsWindow('general');
       return;
     }
 
-    if (e.altKey && e.shiftKey && !e.metaKey && !e.ctrlKey && e.key === 'Backspace') {
+    if (matchesKeyboardEvent(e, 'Alt+Shift+Backspace', isMac)) {
       e.preventDefault();
       void clearUnpinned().then(() => refreshSearch(false));
       return;
     }
 
-    if (matchesAccelerator(e, settings.general.preview_shortcut)) {
+    if (matchesKeyboardEvent(e, settings.general.preview_shortcut, isMac)) {
       e.preventDefault();
       previewOpen = !previewOpen;
       clearAutoPreviewTimer();
       return;
     }
 
-    if (matchesAccelerator(e, settings.general.pin_shortcut)) {
+    if (matchesKeyboardEvent(e, settings.general.pin_shortcut, isMac)) {
       e.preventDefault();
       void handlePinSelected();
       return;
     }
 
-    if (matchesAccelerator(e, settings.general.save_snippet_shortcut)) {
+    if (matchesKeyboardEvent(e, settings.general.save_snippet_shortcut, isMac)) {
       e.preventDefault();
       void openQuickSnippet(false);
       return;
     }
 
-    if (matchesAccelerator(e, settings.general.delete_shortcut)) {
+    if (matchesKeyboardEvent(e, settings.general.delete_shortcut, isMac)) {
       e.preventDefault();
       void handleDeleteSelected();
       return;
@@ -497,7 +428,7 @@
       if (isSingleKey && (searchFocused || query.length > 0)) {
         continue;
       }
-      if (matchesAccelerator(e, custom)) {
+      if (matchesKeyboardEvent(e, custom, isMac)) {
         e.preventDefault();
         void activateRow(row, null);
         return;

@@ -17,10 +17,15 @@
     onRecordingChange: (recording: boolean) => void;
     onModalOpenChange: (open: boolean) => void;
     onSnippetsChanged?: () => void;
+    onDirtyChange?: (dirty: boolean) => void;
   }
 
-  let { onRecordingChange, onModalOpenChange, onSnippetsChanged }: Props =
-    $props();
+  let {
+    onRecordingChange,
+    onModalOpenChange,
+    onSnippetsChanged,
+    onDirtyChange,
+  }: Props = $props();
 
   const platform = detectHotkeyPlatform();
 
@@ -50,10 +55,48 @@
   let shortcutKey = $state('');
   let isPinned = $state(false);
 
+  interface DraftSnapshot {
+    title: string;
+    content: string;
+    tagsRaw: string;
+    language: string;
+    shortcutKey: string;
+    isPinned: boolean;
+  }
+
+  type PendingAction =
+    | { kind: 'select'; snippet: SnippetDto }
+    | { kind: 'new' }
+    | { kind: 'import' };
+
   let saving = $state(false);
   let deleting = $state(false);
+  let confirmingDelete = $state(false);
+  let pendingAction = $state<PendingAction | null>(null);
   let statusMsg = $state<string | null>(null);
   let errorMsg = $state<string | null>(null);
+
+  let baseline = $state<DraftSnapshot>({
+    title: '',
+    content: '',
+    tagsRaw: '',
+    language: 'auto',
+    shortcutKey: '',
+    isPinned: false,
+  });
+
+  let isDirty = $derived(
+    title !== baseline.title ||
+      content !== baseline.content ||
+      tagsRaw !== baseline.tagsRaw ||
+      language !== baseline.language ||
+      shortcutKey !== baseline.shortcutKey ||
+      isPinned !== baseline.isPinned,
+  );
+
+  $effect(() => {
+    onDirtyChange?.(isDirty);
+  });
 
   let exportedJson = $state<string | null>(null);
   let copiedExport = $state(false);
@@ -102,28 +145,93 @@
     /\{\{(date|time|datetime|clipboard|uuid|cursor)\}\}/.test(content),
   );
 
-  function loadSnippetIntoEditor(snippet: SnippetDto): void {
-    selectedId = snippet.id;
-    title = snippet.title;
-    content = snippet.content;
-    tagsRaw = snippet.tags.join(', ');
-    language = snippet.language ?? 'auto';
-    shortcutKey = snippet.shortcut_key ?? '';
-    isPinned = snippet.is_pinned;
+  function applyEditorDraft(
+    next: DraftSnapshot,
+    nextSelectedId: number | null,
+  ): void {
+    selectedId = nextSelectedId;
+    title = next.title;
+    content = next.content;
+    tagsRaw = next.tagsRaw;
+    language = next.language;
+    shortcutKey = next.shortcutKey;
+    isPinned = next.isPinned;
+    baseline = { ...next };
+    confirmingDelete = false;
+    pendingAction = null;
     errorMsg = null;
     statusMsg = null;
   }
 
+  function loadSnippetIntoEditor(snippet: SnippetDto): void {
+    applyEditorDraft(
+      {
+        title: snippet.title,
+        content: snippet.content,
+        tagsRaw: snippet.tags.join(', '),
+        language: snippet.language ?? 'auto',
+        shortcutKey: snippet.shortcut_key ?? '',
+        isPinned: snippet.is_pinned,
+      },
+      snippet.id,
+    );
+  }
+
   function startNewSnippet(): void {
-    selectedId = null;
-    title = '';
-    content = '';
-    tagsRaw = '';
-    language = 'auto';
-    shortcutKey = '';
-    isPinned = false;
-    errorMsg = null;
-    statusMsg = null;
+    applyEditorDraft(
+      {
+        title: '',
+        content: '',
+        tagsRaw: '',
+        language: 'auto',
+        shortcutKey: '',
+        isPinned: false,
+      },
+      null,
+    );
+  }
+
+  function requestSelectSnippet(snippet: SnippetDto): void {
+    if (snippet.id === selectedId) {
+      return;
+    }
+    if (isDirty) {
+      pendingAction = { kind: 'select', snippet };
+      return;
+    }
+    loadSnippetIntoEditor(snippet);
+  }
+
+  function requestNewSnippet(): void {
+    if (isDirty) {
+      pendingAction = { kind: 'new' };
+      return;
+    }
+    startNewSnippet();
+  }
+
+  function requestOpenImportModal(): void {
+    if (isDirty) {
+      pendingAction = { kind: 'import' };
+      return;
+    }
+    openImportModal();
+  }
+
+  function discardAndProceed(): void {
+    const action = pendingAction;
+    pendingAction = null;
+    if (!action) {
+      return;
+    }
+    if (action.kind === 'select') {
+      loadSnippetIntoEditor(action.snippet);
+    } else if (action.kind === 'new') {
+      startNewSnippet();
+    } else {
+      applyEditorDraft({ ...baseline }, selectedId);
+      openImportModal();
+    }
   }
 
   export async function refreshSnippets(selectTargetId?: number | null): Promise<void> {
@@ -184,7 +292,10 @@
       .map((t) => t.trim())
       .filter(Boolean);
 
+    const wasNew = selectedId === null;
     saving = true;
+    confirmingDelete = false;
+    pendingAction = null;
     errorMsg = null;
     statusMsg = null;
 
@@ -198,7 +309,7 @@
         is_pinned: isPinned,
       });
       await refreshSnippets(saved.id);
-      statusMsg = selectedId === null ? 'Snippet created.' : 'Snippet saved.';
+      statusMsg = wasNew ? 'Snippet created.' : 'Snippet saved.';
       onSnippetsChanged?.();
     } catch (err) {
       errorMsg = err instanceof Error ? err.message : String(err);
@@ -211,11 +322,18 @@
     if (selectedId === null) {
       return;
     }
+    if (!confirmingDelete) {
+      confirmingDelete = true;
+      errorMsg = null;
+      statusMsg = null;
+      return;
+    }
     deleting = true;
     errorMsg = null;
     statusMsg = null;
     try {
       await deleteSnippet(selectedId);
+      confirmingDelete = false;
       selectedId = null;
       await refreshSnippets();
       if (snippets.length === 0) {
@@ -245,7 +363,7 @@
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
       statusMsg = 'Exported snippets to clipo-snippets.json.';
     } catch (err) {
       errorMsg = err instanceof Error ? err.message : String(err);
@@ -327,7 +445,7 @@
         <span class="text-[12px] font-semibold">Snippets ({snippets.length})</span>
         <button
           type="button"
-          onclick={startNewSnippet}
+          onclick={requestNewSnippet}
           class="rounded-md px-2 py-1 text-[11px] font-semibold text-white hover:opacity-90"
           style:background-color="var(--clipo-accent)"
         >
@@ -362,7 +480,7 @@
             {@const active = selectedId === snippet.id}
             <button
               type="button"
-              onclick={() => loadSnippetIntoEditor(snippet)}
+              onclick={() => requestSelectSnippet(snippet)}
               class="flex w-full flex-col gap-1 rounded-lg px-2.5 py-2 text-left transition-colors"
               style:background-color={active
                 ? 'var(--clipo-accent-soft)'
@@ -416,7 +534,7 @@
       </button>
       <button
         type="button"
-        onclick={openImportModal}
+        onclick={requestOpenImportModal}
         class="flex-1 rounded-md border px-2 py-1 text-[11px] font-medium hover:opacity-85"
         style:background-color="var(--clipo-surface)"
         style:border-color="var(--clipo-border)"
@@ -452,15 +570,36 @@
         {/if}
 
         {#if selectedId !== null}
+          {#if confirmingDelete}
+            <button
+              type="button"
+              onclick={() => {
+                confirmingDelete = false;
+              }}
+              class="rounded-md border px-2 py-1 text-[11.5px] font-medium hover:opacity-85"
+              style:border-color="var(--clipo-border)"
+            >
+              Cancel
+            </button>
+          {/if}
           <button
             type="button"
             onclick={() => void handleDelete()}
             disabled={deleting}
-            class="rounded-md border px-2.5 py-1 text-[11.5px] font-medium hover:opacity-85 disabled:opacity-50"
-            style:border-color="var(--clipo-border)"
-            style:color="var(--clipo-danger)"
+            class="rounded-md border px-2.5 py-1 text-[11.5px] font-semibold transition-opacity hover:opacity-85 disabled:opacity-50"
+            style:background-color={confirmingDelete
+              ? 'var(--clipo-danger)'
+              : 'transparent'}
+            style:border-color={confirmingDelete
+              ? 'var(--clipo-danger)'
+              : 'var(--clipo-border)'}
+            style:color={confirmingDelete ? '#ffffff' : 'var(--clipo-danger)'}
           >
-            {deleting ? 'Deleting…' : 'Delete'}
+            {deleting
+              ? 'Deleting…'
+              : confirmingDelete
+                ? 'Confirm delete'
+                : 'Delete'}
           </button>
         {/if}
 
@@ -474,6 +613,44 @@
         </button>
       </div>
     </div>
+
+    {#if pendingAction}
+      <div
+        role="alert"
+        class="flex flex-wrap items-center justify-between gap-2 rounded-md border px-2.5 py-2 text-[11.5px]"
+        style:background-color="rgba(217, 119, 6, 0.12)"
+        style:border-color="rgba(217, 119, 6, 0.35)"
+      >
+        <span style:color="var(--clipo-warning)">
+          {pendingAction.kind === 'select'
+            ? `Discard unsaved changes and open "${pendingAction.snippet.title}"?`
+            : pendingAction.kind === 'new'
+              ? 'Discard unsaved changes and start a new snippet?'
+              : 'Discard unsaved changes and import snippets?'}
+        </span>
+        <div class="flex items-center gap-1.5">
+          <button
+            type="button"
+            onclick={() => {
+              pendingAction = null;
+            }}
+            class="rounded border px-2 py-0.5 text-[11px] font-medium hover:opacity-85"
+            style:background-color="var(--clipo-surface)"
+            style:border-color="var(--clipo-border)"
+          >
+            Keep editing
+          </button>
+          <button
+            type="button"
+            onclick={discardAndProceed}
+            class="rounded px-2 py-0.5 text-[11px] font-semibold text-white hover:opacity-90"
+            style:background-color="var(--clipo-danger)"
+          >
+            Discard changes
+          </button>
+        </div>
+      </div>
+    {/if}
 
     {#if errorMsg}
       <div
@@ -608,8 +785,10 @@
         <span class="font-medium">
           Variables:
           <code class="font-mono">{'{{date}}'}</code>,
-          <code class="font-mono">{'{{uuid}}'}</code>,
+          <code class="font-mono">{'{{time}}'}</code>,
+          <code class="font-mono">{'{{datetime}}'}</code>,
           <code class="font-mono">{'{{clipboard}}'}</code>,
+          <code class="font-mono">{'{{uuid}}'}</code>,
           <code class="font-mono">{'{{cursor}}'}</code>
         </span>
       </div>

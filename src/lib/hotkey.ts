@@ -59,10 +59,6 @@ const MODIFIER_KEYS = new Set([
   'os',
   'super',
   'altgraph',
-  'capslock',
-  'fn',
-  'dead',
-  'unidentified',
 ]);
 
 const KEY_ALIASES: Record<string, string> = {
@@ -98,7 +94,7 @@ const KEY_ALIASES: Record<string, string> = {
   backquote: '`',
   minus: '-',
   equal: '=',
-  plus: '+',
+  plus: '=',
   bracketleft: '[',
   bracketright: ']',
 };
@@ -142,7 +138,6 @@ const ALLOWED_PUNCTUATION = new Set([
   '`',
   '-',
   '=',
-  '+',
   '[',
   ']',
 ]);
@@ -223,22 +218,11 @@ function splitAcceleratorParts(accelerator: string): string[] {
   if (!trimmed) {
     return [];
   }
-  // Preserve trailing `+` when encoded as `CommandOrControl++`
-  if (trimmed === '+') {
-    return ['+'];
+  const rawParts = trimmed.split('+').map((p) => p.trim());
+  if (rawParts.some((p) => p.length === 0)) {
+    return [];
   }
-  if (trimmed.endsWith('++')) {
-    const prefix = trimmed.slice(0, -2);
-    const head = prefix
-      .split('+')
-      .map((p) => p.trim())
-      .filter(Boolean);
-    return [...head, '+'];
-  }
-  return trimmed
-    .split('+')
-    .map((p) => p.trim())
-    .filter(Boolean);
+  return rawParts;
 }
 
 export function parseHotkey(accelerator: string): ParsedHotkey | null {
@@ -412,6 +396,37 @@ export function validateHotkey(
     };
   }
   return { valid: true, normalized: parsed.canonical };
+}
+
+export function matchesKeyboardEvent(
+  event: HotkeyEventLike,
+  accelerator: string,
+  isMac?: boolean,
+): boolean {
+  const parsed = parseHotkey(accelerator);
+  if (!parsed) {
+    return false;
+  }
+
+  const platform: HotkeyPlatform =
+    isMac === undefined ? detectHotkeyPlatform() : isMac ? 'mac' : 'other';
+
+  const needMeta =
+    parsed.meta || (platform === 'mac' && parsed.commandOrControl);
+  const needCtrl =
+    parsed.control || (platform !== 'mac' && parsed.commandOrControl);
+
+  if (
+    Boolean(event.metaKey) !== needMeta ||
+    Boolean(event.ctrlKey) !== needCtrl ||
+    Boolean(event.altKey) !== parsed.alt ||
+    Boolean(event.shiftKey) !== parsed.shift
+  ) {
+    return false;
+  }
+
+  const eventKey = resolveKeyFromEvent(event);
+  return eventKey !== null && eventKey === parsed.key;
 }
 
 function formatMacKey(key: string): string {

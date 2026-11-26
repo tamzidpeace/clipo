@@ -162,11 +162,22 @@
             max="10000"
             value={settings.storage.max_items}
             onchange={(e) => {
-              const next = clampMaxItems(
-                Number((e.currentTarget as HTMLInputElement).value),
-              );
-              (e.currentTarget as HTMLInputElement).value = String(next);
-              onUpdateStorage({ max_items: next });
+              const input = e.currentTarget as HTMLInputElement;
+              const raw = input.value.trim();
+              if (!raw) {
+                input.value = String(settings.storage.max_items);
+                return;
+              }
+              const parsed = Number(raw);
+              if (!Number.isFinite(parsed)) {
+                input.value = String(settings.storage.max_items);
+                return;
+              }
+              const next = clampMaxItems(parsed);
+              input.value = String(next);
+              if (next !== settings.storage.max_items) {
+                onUpdateStorage({ max_items: next });
+              }
             }}
             class="h-7 w-20 rounded-md border px-2 text-center font-mono text-[12px] tabular-nums outline-none"
             style:background-color="var(--clipo-surface)"

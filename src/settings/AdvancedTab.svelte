@@ -9,7 +9,7 @@
     settings: AppSettingsDto;
     runtimeStatus: RuntimeStatusDto | null;
     onUpdateAdvanced: (patch: Partial<AdvancedSettingsDto>) => void;
-    onTogglePaused: (paused: boolean) => void;
+    onTogglePaused: (paused: boolean) => Promise<void>;
     onIgnoreNext: () => void;
     onClearUnpinned: () => Promise<void>;
   }
@@ -112,8 +112,11 @@
         <input
           type="checkbox"
           checked={isPaused}
-          onchange={(e) =>
-            onTogglePaused((e.currentTarget as HTMLInputElement).checked)}
+          onchange={async (e) => {
+            const input = e.currentTarget as HTMLInputElement;
+            await onTogglePaused(input.checked);
+            input.checked = isPaused;
+          }}
           class="h-4 w-4 accent-[var(--clipo-accent)]"
         />
       </label>
@@ -168,11 +171,22 @@
           step="50"
           value={settings.advanced.poll_interval_ms}
           onchange={(e) => {
-            const next = clampPollInterval(
-              Number((e.currentTarget as HTMLInputElement).value),
-            );
-            (e.currentTarget as HTMLInputElement).value = String(next);
-            onUpdateAdvanced({ poll_interval_ms: next });
+            const input = e.currentTarget as HTMLInputElement;
+            const raw = input.value.trim();
+            if (!raw) {
+              input.value = String(settings.advanced.poll_interval_ms);
+              return;
+            }
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed)) {
+              input.value = String(settings.advanced.poll_interval_ms);
+              return;
+            }
+            const next = clampPollInterval(parsed);
+            input.value = String(next);
+            if (next !== settings.advanced.poll_interval_ms) {
+              onUpdateAdvanced({ poll_interval_ms: next });
+            }
           }}
           class="w-24 rounded-md border px-2 py-1 text-center font-mono text-[12px] tabular-nums outline-none"
           style:background-color="var(--clipo-surface)"

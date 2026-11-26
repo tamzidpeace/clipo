@@ -120,16 +120,22 @@
     }
   }
 
-  async function handleToggleEnabled(rule: IgnoreRuleDto): Promise<void> {
+  async function handleToggleEnabled(
+    rule: IgnoreRuleDto,
+    input: HTMLInputElement,
+  ): Promise<void> {
+    const previous = rule.enabled;
+    const next = input.checked;
     formError = null;
     try {
       await onUpsertRule(
         rule.id,
         rule.rule_type,
         rule.pattern,
-        !rule.enabled,
+        next,
       );
     } catch (err) {
+      input.checked = previous;
       formError = err instanceof Error ? err.message : String(err);
     }
   }
@@ -293,7 +299,11 @@
               <input
                 type="checkbox"
                 checked={rule.enabled}
-                onchange={() => void handleToggleEnabled(rule)}
+                onchange={(e) =>
+                  void handleToggleEnabled(
+                    rule,
+                    e.currentTarget as HTMLInputElement,
+                  )}
                 class="h-4 w-4 shrink-0 accent-[var(--clipo-accent)]"
               />
               <span

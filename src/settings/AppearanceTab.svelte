@@ -17,6 +17,11 @@
   let { settings, onUpdateAppearance }: Props = $props();
 
   let showSearchField = $derived(settings.appearance.search_field !== 'never');
+  let localImageHeight = $state(40);
+
+  $effect(() => {
+    localImageHeight = settings.appearance.image_height;
+  });
 
   function clampNumber(raw: number, min: number, max: number, fallback: number): number {
     if (!Number.isFinite(raw)) {
@@ -94,32 +99,74 @@
             min="20"
             max="120"
             step="2"
-            value={settings.appearance.image_height}
-            oninput={(e) =>
-              onUpdateAppearance({
-                image_height: clampNumber(
-                  Number((e.currentTarget as HTMLInputElement).value),
+            value={localImageHeight}
+            oninput={(e) => {
+              const raw = (e.currentTarget as HTMLInputElement).value.trim();
+              const parsed = Number(raw);
+              if (raw && Number.isFinite(parsed)) {
+                localImageHeight = clampNumber(
+                  parsed,
                   20,
                   120,
-                  40,
-                ),
-              })}
+                  settings.appearance.image_height,
+                );
+              }
+            }}
+            onchange={(e) => {
+              const input = e.currentTarget as HTMLInputElement;
+              const raw = input.value.trim();
+              if (!raw) {
+                localImageHeight = settings.appearance.image_height;
+                return;
+              }
+              const parsed = Number(raw);
+              if (!Number.isFinite(parsed)) {
+                localImageHeight = settings.appearance.image_height;
+                return;
+              }
+              const next = clampNumber(
+                parsed,
+                20,
+                120,
+                settings.appearance.image_height,
+              );
+              localImageHeight = next;
+              if (next !== settings.appearance.image_height) {
+                onUpdateAppearance({ image_height: next });
+              }
+            }}
             class="w-28 accent-[var(--clipo-accent)]"
           />
           <input
             type="number"
             min="20"
             max="120"
-            value={settings.appearance.image_height}
+            value={localImageHeight}
             onchange={(e) => {
+              const input = e.currentTarget as HTMLInputElement;
+              const raw = input.value.trim();
+              if (!raw) {
+                localImageHeight = settings.appearance.image_height;
+                input.value = String(settings.appearance.image_height);
+                return;
+              }
+              const parsed = Number(raw);
+              if (!Number.isFinite(parsed)) {
+                localImageHeight = settings.appearance.image_height;
+                input.value = String(settings.appearance.image_height);
+                return;
+              }
               const next = clampNumber(
-                Number((e.currentTarget as HTMLInputElement).value),
+                parsed,
                 20,
                 120,
-                40,
+                settings.appearance.image_height,
               );
-              (e.currentTarget as HTMLInputElement).value = String(next);
-              onUpdateAppearance({ image_height: next });
+              localImageHeight = next;
+              input.value = String(next);
+              if (next !== settings.appearance.image_height) {
+                onUpdateAppearance({ image_height: next });
+              }
             }}
             class="w-16 rounded-md border px-2 py-1 text-center font-mono text-[12px] tabular-nums outline-none"
             style:background-color="var(--clipo-surface)"
@@ -164,14 +211,27 @@
             disabled={!settings.appearance.open_preview_automatically}
             value={settings.appearance.preview_delay_ms}
             onchange={(e) => {
+              const input = e.currentTarget as HTMLInputElement;
+              const raw = input.value.trim();
+              if (!raw) {
+                input.value = String(settings.appearance.preview_delay_ms);
+                return;
+              }
+              const parsed = Number(raw);
+              if (!Number.isFinite(parsed)) {
+                input.value = String(settings.appearance.preview_delay_ms);
+                return;
+              }
               const next = clampNumber(
-                Number((e.currentTarget as HTMLInputElement).value),
+                parsed,
                 0,
                 10000,
-                1500,
+                settings.appearance.preview_delay_ms,
               );
-              (e.currentTarget as HTMLInputElement).value = String(next);
-              onUpdateAppearance({ preview_delay_ms: next });
+              input.value = String(next);
+              if (next !== settings.appearance.preview_delay_ms) {
+                onUpdateAppearance({ preview_delay_ms: next });
+              }
             }}
             class="w-24 rounded-md border px-2 py-1 text-center font-mono text-[12px] tabular-nums outline-none disabled:opacity-45"
             style:background-color="var(--clipo-surface)"

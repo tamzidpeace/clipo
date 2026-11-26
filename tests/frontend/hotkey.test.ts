@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   eventToAccelerator,
   formatHotkey,
+  matchesKeyboardEvent,
   parseHotkey,
   validateHotkey,
 } from '../../src/lib/hotkey';
@@ -81,11 +82,21 @@ describe('hotkey utilities', () => {
       });
     });
 
-    it('returns null for empty or modifier-only strings', () => {
+    it('returns null for empty, malformed +, or modifier-only strings', () => {
       expect(parseHotkey('')).toBeNull();
       expect(parseHotkey('   ')).toBeNull();
       expect(parseHotkey('Shift')).toBeNull();
       expect(parseHotkey('CommandOrControl+Alt')).toBeNull();
+      expect(parseHotkey('CommandOrControl++')).toBeNull();
+      expect(parseHotkey('CommandOrControl+')).toBeNull();
+      expect(parseHotkey('+')).toBeNull();
+    });
+
+    it('normalizes plus alias without emitting trailing ++', () => {
+      const parsed = parseHotkey('CommandOrControl+plus');
+      expect(parsed).not.toBeNull();
+      expect(parsed?.canonical).toBe('CommandOrControl+=');
+      expect(parsed?.canonical.endsWith('++')).toBe(false);
     });
   });
 
@@ -202,6 +213,67 @@ describe('hotkey utilities', () => {
         accelerator: 'Space',
       });
     });
+
+    it('resolves macOS Option dead-key shortcuts via event.code', () => {
+      expect(
+        eventToAccelerator(
+          { key: 'Dead', code: 'KeyE', altKey: true },
+          { platform: 'mac', requireModifier: true },
+        ),
+      ).toEqual({
+        ok: true,
+        accelerator: 'Alt+E',
+      });
+
+      expect(
+        eventToAccelerator(
+          { key: 'Dead', code: 'KeyN', altKey: true },
+          { platform: 'mac', requireModifier: true },
+        ),
+      ).toEqual({
+        ok: true,
+        accelerator: 'Alt+N',
+      });
+
+      expect(
+        eventToAccelerator(
+          { key: 'Dead', code: 'Backquote', altKey: true },
+          { platform: 'mac', requireModifier: true },
+        ),
+      ).toEqual({
+        ok: true,
+        accelerator: 'Alt+`',
+      });
+    });
+
+    it('rejects CapsLock, Unidentified, Fn, and codeless Dead as unsupported_key', () => {
+      for (const event of [
+        { key: 'CapsLock', code: 'CapsLock' },
+        { key: 'Unidentified' },
+        { key: 'Fn', code: 'Fn' },
+        { key: 'Dead' },
+      ]) {
+        const result = eventToAccelerator(event, {
+          platform: 'mac',
+          requireModifier: false,
+        });
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.reason).toBe('unsupported_key');
+        }
+      }
+    });
+
+    it('encodes Shift+Equal (+ key) as CommandOrControl+Shift+= without trailing ++', () => {
+      const result = eventToAccelerator(
+        { key: '+', code: 'Equal', shiftKey: true, metaKey: true },
+        { platform: 'mac', requireModifier: true },
+      );
+      expect(result).toEqual({
+        ok: true,
+        accelerator: 'CommandOrControl+Shift+=',
+      });
+    });
   });
 
   describe('validateHotkey', () => {
@@ -217,6 +289,130 @@ describe('hotkey utilities', () => {
         valid: true,
         normalized: 'F2',
       });
+      expect(validateHotkey('CommandOrControl++', { requireModifier: true }).valid).toBe(false);
+    });
+  });
+
+  describe('matchesKeyboardEvent', () => {
+    it('matches arrow keys across platforms', () => {
+      expect(
+        matchesKeyboardEvent(
+          { key: 'ArrowUp', code: 'ArrowUp', altKey: true },
+          'Alt+Up',
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'ArrowDown', code: 'ArrowDown' },
+          'Down',
+          false,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'ArrowLeft', code: 'ArrowLeft', ctrlKey: true },
+          'CommandOrControl+Left',
+          false,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'ArrowRight', code: 'ArrowRight', metaKey: true },
+          'CommandOrControl+Right',
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'ArrowUp', code: 'ArrowUp', altKey: true, shiftKey: true },
+          'Alt+Up',
+          true,
+        ),
+      ).toBe(false);
+    });
+
+    it('matches macOS Option+punctuation and Option dead-key shortcuts', () => {
+      expect(
+        matchesKeyboardEvent(
+          { key: '“', code: 'BracketLeft', altKey: true },
+          'Alt+[',
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: '…', code: 'Semicolon', altKey: true },
+          'Alt+;',
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'Dead', code: 'KeyE', altKey: true },
+          'Alt+E',
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'Dead', code: 'KeyN', altKey: true },
+          'Alt+N',
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'Dead', code: 'Backquote', altKey: true },
+          'Alt+`',
+          true,
+        ),
+      ).toBe(true);
+    });
+
+    it('matches CommandOrControl accelerators correctly on macOS vs Windows/Linux', () => {
+      expect(
+        matchesKeyboardEvent(
+          { key: 'c', code: 'KeyC', metaKey: true, shiftKey: true },
+          'CommandOrControl+Shift+C',
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'c', code: 'KeyC', ctrlKey: true, shiftKey: true },
+          'CommandOrControl+Shift+C',
+          true,
+        ),
+      ).toBe(false);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'c', code: 'KeyC', ctrlKey: true, shiftKey: true },
+          'CommandOrControl+Shift+C',
+          false,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: 'c', code: 'KeyC', metaKey: true, shiftKey: true },
+          'CommandOrControl+Shift+C',
+          false,
+        ),
+      ).toBe(false);
+      expect(
+        matchesKeyboardEvent(
+          { key: ',', code: 'Comma', metaKey: true },
+          'CommandOrControl+,',
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        matchesKeyboardEvent(
+          { key: ',', code: 'Comma', ctrlKey: true },
+          'CommandOrControl+,',
+          false,
+        ),
+      ).toBe(true);
     });
   });
 
