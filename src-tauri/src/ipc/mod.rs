@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::ClipoError;
 
+/// Maximum byte length allowed for a single newline-delimited IPC message or acknowledgement.
+pub const MAX_IPC_LINE_BYTES: usize = 1024;
+
 /// IPC control commands sent from CLI invocations to the running Clipo daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,7 +89,7 @@ pub fn default_ipc_endpoint() -> PathBuf {
             PathBuf::from("/tmp").join(&scope).join("clipo.sock")
         };
         if let Some(parent) = sock.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = ensure_private_unix_dir(parent);
         }
         sock
     }
@@ -95,6 +98,14 @@ pub fn default_ipc_endpoint() -> PathBuf {
     {
         PathBuf::from(r"\\.\pipe\clipo-ipc")
     }
+}
+
+#[cfg(unix)]
+fn ensure_private_unix_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(unix)]
@@ -129,10 +140,20 @@ fn serialize_ipc_line(cmd: IpcCommand) -> Result<String, ClipoError> {
     Ok(line)
 }
 
+fn check_line_length(line: &str) -> Result<(), ClipoError> {
+    if line.len() > MAX_IPC_LINE_BYTES {
+        return Err(ClipoError::InvalidInput(format!(
+            "IPC line exceeds maximum length of {MAX_IPC_LINE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn dispatch_ipc_line(
     line: &str,
     handler: &(dyn Fn(IpcCommand) + Send + Sync),
 ) -> Result<&'static [u8], ClipoError> {
+    check_line_length(line)?;
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Err(ClipoError::InvalidInput("empty IPC command".to_string()));
@@ -143,6 +164,7 @@ fn dispatch_ipc_line(
 }
 
 fn validate_ack_response(resp: &str) -> Result<(), ClipoError> {
+    check_line_length(resp)?;
     let trimmed = resp.trim();
     if trimmed == "ok" {
         Ok(())
@@ -159,18 +181,60 @@ fn validate_ack_response(resp: &str) -> Result<(), ClipoError> {
 
 #[cfg(unix)]
 mod platform {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread::JoinHandle;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{dispatch_ipc_line, serialize_ipc_line, validate_ack_response, IpcCommand};
+    use super::{
+        check_line_length, dispatch_ipc_line, ensure_private_unix_dir, serialize_ipc_line,
+        validate_ack_response, IpcCommand, MAX_IPC_LINE_BYTES,
+    };
     use crate::models::ClipoError;
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct DeadlineStream<'a> {
+        stream: &'a UnixStream,
+        deadline: Instant,
+    }
+
+    impl Read for DeadlineStream<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "IPC read deadline exceeded",
+                    ));
+                };
+                let _ = self
+                    .stream
+                    .set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
+                match (&*self.stream).read(buf) {
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    other => return other,
+                }
+            }
+        }
+    }
+
+    fn read_bounded_line(stream: &UnixStream, timeout: Duration) -> Result<String, ClipoError> {
+        let limited = DeadlineStream {
+            stream,
+            deadline: Instant::now() + timeout,
+        }
+        .take((MAX_IPC_LINE_BYTES + 1) as u64);
+        let mut reader = BufReader::new(limited);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        check_line_length(&line)?;
+        Ok(line)
+    }
 
     /// Local IPC server listening on a Unix domain socket.
     pub struct IpcServer {
@@ -187,28 +251,45 @@ mod platform {
         ) -> Result<Self, ClipoError> {
             if let Some(parent) = socket_path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
+                    let is_clipo_dir = parent
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("clipo"));
+                    if !parent.exists() || is_clipo_dir {
+                        ensure_private_unix_dir(parent)?;
+                    }
                 }
             }
 
-            if std::fs::symlink_metadata(socket_path).is_ok() {
-                match UnixStream::connect(socket_path) {
-                    Ok(_) => {
-                        return Err(ClipoError::Io(std::io::Error::new(
-                            std::io::ErrorKind::AddrInUse,
-                            format!("IPC endpoint already active at {}", socket_path.display()),
+            match std::fs::symlink_metadata(socket_path) {
+                Ok(meta) => {
+                    if !meta.file_type().is_socket() {
+                        return Err(ClipoError::InvalidInput(format!(
+                            "refusing to overwrite non-socket IPC path {}",
+                            socket_path.display()
                         )));
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                        return Err(ClipoError::Io(err));
-                    }
-                    Err(_) => {
-                        std::fs::remove_file(socket_path)?;
+                    match UnixStream::connect(socket_path) {
+                        Ok(_) => {
+                            return Err(ClipoError::Io(std::io::Error::new(
+                                std::io::ErrorKind::AddrInUse,
+                                format!("IPC endpoint already active at {}", socket_path.display()),
+                            )));
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                            return Err(ClipoError::Io(err));
+                        }
+                        Err(_) => {
+                            std::fs::remove_file(socket_path)?;
+                        }
                     }
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(ClipoError::Io(err)),
             }
 
             let listener = UnixListener::bind(socket_path)?;
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
             listener.set_nonblocking(true)?;
             let stop_flag = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop_flag);
@@ -245,8 +326,6 @@ mod platform {
     impl Drop for IpcServer {
         fn drop(&mut self) {
             self.stop_flag.store(true, Ordering::Release);
-            // Wake blocking `accept()` in the listener thread cleanly.
-            let _ = UnixStream::connect(&self.socket_path);
             if let Some(handle) = self.thread.take() {
                 let _ = handle.join();
             }
@@ -260,14 +339,17 @@ mod platform {
     ) -> Result<(), ClipoError> {
         // Accepted sockets may inherit non-blocking mode from the listener on BSD/macOS.
         stream.set_nonblocking(false)?;
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
 
-        let mut line = String::new();
-        {
-            let mut reader = BufReader::new(&stream);
-            reader.read_line(&mut line)?;
-        }
+        let line = match read_bounded_line(&stream, IO_TIMEOUT) {
+            Ok(line) => line,
+            Err(err) => {
+                let msg = format!("err:{err}\n");
+                let _ = stream.write_all(msg.as_bytes());
+                let _ = stream.flush();
+                return Err(err);
+            }
+        };
 
         if line.is_empty() {
             return Ok(());
@@ -290,16 +372,13 @@ mod platform {
     /// Sends a single [`IpcCommand`] to a running [`IpcServer`] at `socket_path` and waits for ack.
     pub fn send_ipc_command(socket_path: &Path, cmd: IpcCommand) -> Result<(), ClipoError> {
         let mut stream = UnixStream::connect(socket_path)?;
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
 
         let payload = serialize_ipc_line(cmd)?;
         stream.write_all(payload.as_bytes())?;
         stream.flush()?;
 
-        let mut resp = String::new();
-        let mut reader = BufReader::new(&stream);
-        reader.read_line(&mut resp)?;
+        let resp = read_bounded_line(&stream, IO_TIMEOUT)?;
         validate_ack_response(&resp)
     }
 }
@@ -314,16 +393,37 @@ mod platform {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
     use tokio::sync::oneshot;
 
-    use super::{dispatch_ipc_line, serialize_ipc_line, validate_ack_response, IpcCommand};
+    use super::{
+        check_line_length, dispatch_ipc_line, serialize_ipc_line, validate_ack_response,
+        IpcCommand, MAX_IPC_LINE_BYTES,
+    };
     use crate::models::ClipoError;
 
     // Win32 `ERROR_PIPE_BUSY` (0xE7) returned by CreateFile when all pipe instances are busy.
     const ERROR_PIPE_BUSY: i32 = 231;
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn read_bounded_line_async<R: AsyncRead + Unpin>(
+        reader_src: R,
+        timeout: Duration,
+    ) -> Result<String, ClipoError> {
+        let mut reader = BufReader::new(reader_src.take((MAX_IPC_LINE_BYTES + 1) as u64));
+        let mut line = String::new();
+        tokio::time::timeout(timeout, reader.read_line(&mut line))
+            .await
+            .map_err(|_| {
+                ClipoError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "IPC read timeout",
+                ))
+            })??;
+        check_line_length(&line)?;
+        Ok(line)
+    }
 
     enum AcceptEvent {
         Shutdown,
@@ -418,12 +518,15 @@ mod platform {
         handler: &(dyn Fn(IpcCommand) + Send + Sync),
     ) -> Result<(), ClipoError> {
         let (read_half, mut write_half) = tokio::io::split(stream);
-        let mut reader = BufReader::new(read_half);
-        let mut line = String::new();
-
-        tokio::time::timeout(IO_TIMEOUT, reader.read_line(&mut line))
-            .await
-            .map_err(|_| ClipoError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC read timeout")))??;
+        let line = match read_bounded_line_async(read_half, IO_TIMEOUT).await {
+            Ok(line) => line,
+            Err(err) => {
+                let msg = format!("err:{err}\n");
+                let _ = write_half.write_all(msg.as_bytes()).await;
+                let _ = write_half.flush().await;
+                return Err(err);
+            }
+        };
 
         if line.is_empty() {
             return Ok(());
@@ -474,16 +577,7 @@ mod platform {
             write_half.write_all(payload.as_bytes()).await?;
             write_half.flush().await?;
 
-            let mut reader = BufReader::new(read_half);
-            let mut resp = String::new();
-            tokio::time::timeout(IO_TIMEOUT, reader.read_line(&mut resp))
-                .await
-                .map_err(|_| {
-                    ClipoError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "IPC ack timeout",
-                    ))
-                })??;
+            let resp = read_bounded_line_async(read_half, IO_TIMEOUT).await?;
             validate_ack_response(&resp)
         })
     }
